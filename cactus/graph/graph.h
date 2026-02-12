@@ -253,6 +253,10 @@ struct BufferDesc {
         return precision == Precision::INT8 && group_size > 0;
     }
 
+    bool is_grouped_int4() const {
+        return precision == Precision::INT4 && group_size > 0;
+    }
+
     void set_grouped_scales(size_t gs, size_t ng, void* scales_ptr) {
         group_size = gs;
         num_groups = ng;

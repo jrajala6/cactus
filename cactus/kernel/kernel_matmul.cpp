@@ -478,3 +478,176 @@ void cactus_matmul_int8(
         cactus_gemm_int8(A, A_scales, B, B_scales, C, M, K, N, group_size);
     }
 }
+
+vvoid cactus_gemv_int4(
+    const int8_t* A,
+    const float A_scale,
+    const uint8_t* B_packed,
+    const __fp16* B_scales,
+    __fp16* C,
+    size_t K, size_t N,
+    size_t group_size
+) {
+    if (K == 0 || N == 0) return;
+
+    const size_t num_groups = K / group_size;
+    const size_t N_blocks = (N + 3) / 4;
+
+    auto unpack_16_nibbles = [](const uint8_t* ptr) {
+        uint8x8_t packed = vld1_u8(ptr);
+        uint8x8_t lo = vand_u8(packed, vdup_n_u8(0x0F));
+        uint8x8_t hi = vshr_n_u8(packed, 4);
+        int8x8_t lo_s = vsub_s8(vreinterpret_s8_u8(lo), vdup_n_s8(8));
+        int8x8_t hi_s = vsub_s8(vreinterpret_s8_u8(hi), vdup_n_s8(8));
+        return vcombine_s8(lo_s, hi_s);
+    };
+
+    auto process_blocks = [=](<size_t block_start, size_t block_end>) {
+        for (size_t n_block = block_start; n_block < block_end; ++n_block) {
+            const size_t n_start = n_block * 4;
+            const size_t actual_n = std::min(size_t(4), N - n_start);
+            float32x4_t running_sum = vdupq_n_f32(0.0f);
+
+            size_t g = 0;
+            for (; g + 1 < num_groups; g += 2) {
+                const size_t k_base0 = g * group_size;
+                const size_t k_base1 = (g + 1) * group_size;
+
+                const int8_t* a_ptr0 = A + k_base0;
+                const int8_t* a_ptr1 = A + k_base1;
+                
+                const uint8_t* b_base0 = B_packed + (n_block * K + k_base0) * 2;
+                const uint8_t* b_base1 = B_packed + (n_block * K + k_base1) * 2;
+
+                __builtin_prefetch(b_base0 + group_size * 4, 0, 3);
+
+                int32x4_t acc0 = vdupq_n_s32(0);
+                int32x4_t acc1 = vdupq_n_s32(0);
+
+                {
+                    int8x16_t a_vec = vld1q_s8(a_ptr0);
+                    int8x16_t b0 = unpack_16_nibbles(b_base0);
+                    int8x16_t b1 = unpack_16_nibbles(b_base0 + 8);
+                    int8x16_t b2 = unpack_16_nibbles(b_base0 + 16);
+                    int8x16_t b3 = unpack_16_nibbles(b_base0 + 24);
+
+                    acc0 = CACTUS_DOTQ_LANE(acc0, b0, a_vec, 0);
+                    acc0 = CACTUS_DOTQ_LANE(acc0, b1, a_vec, 1);
+                    acc0 = CACTUS_DOTQ_LANE(acc0, b2, a_vec, 2);
+                    acc0 = CACTUS_DOTQ_LANE(acc0, b3, a_vec, 3);
+
+                    a_vec = vld1q_s8(a_ptr0 + 16);
+                    b0 = unpack_16_nibbles(b_base0 + 32);
+                    b1 = unpack_16_nibbles(b_base0 + 40);
+                    b2 = unpack_16_nibbles(b_base0 + 48);
+                    b3 = unpack_16_nibbles(b_base0 + 56);
+
+                    acc0 = CACTUS_DOTQ_LANE(acc0, b0, a_vec, 0);
+                    acc0 = CACTUS_DOTQ_LANE(acc0, b1, a_vec, 1);
+                    acc0 = CACTUS_DOTQ_LANE(acc0, b2, a_vec, 2);
+                    acc0 = CACTUS_DOTQ_LANE(acc0, b3, a_vec, 3);
+                }
+
+                // --- GROUP 1 (Second half of the pair) ---
+                {
+                    int8x16_t a_vec = vld1q_s8(a_ptr1);
+                    int8x16_t b0 = unpack_16_nibbles(b_base1);
+                    int8x16_t b1 = unpack_16_nibbles(b_base1 + 8);
+                    int8x16_t b2 = unpack_16_nibbles(b_base1 + 16);
+                    int8x16_t b3 = unpack_16_nibbles(b_base1 + 24);
+
+                    acc1 = CACTUS_DOTQ_LANE(acc1, b0, a_vec, 0);
+                    acc1 = CACTUS_DOTQ_LANE(acc1, b1, a_vec, 1);
+                    acc1 = CACTUS_DOTQ_LANE(acc1, b2, a_vec, 2);
+                    acc1 = CACTUS_DOTQ_LANE(acc1, b3, a_vec, 3);
+
+                    a_vec = vld1q_s8(a_ptr1 + 16);
+                    b0 = unpack_16_nibbles(b_base1 + 32);
+                    b1 = unpack_16_nibbles(b_base1 + 40);
+                    b2 = unpack_16_nibbles(b_base1 + 48);
+                    b3 = unpack_16_nibbles(b_base1 + 56);
+
+                    acc1 = CACTUS_DOTQ_LANE(acc1, b0, a_vec, 0);
+                    acc1 = CACTUS_DOTQ_LANE(acc1, b1, a_vec, 1);
+                    acc1 = CACTUS_DOTQ_LANE(acc1, b2, a_vec, 2);
+                    acc1 = CACTUS_DOTQ_LANE(acc1, b3, a_vec, 3);
+                }
+
+                const __fp16* scale_ptr0 = B_scales + (n_block * num_groups + g) * 4;
+                const __fp16* scale_ptr1 = B_scales + (n_block * num_groups + g + 1) * 4;
+
+                float16x4_t scales0_f16 = vld1_f16(scale_ptr0);
+                float16x4_t scales1_f16 = vld1_f16(scale_ptr1);
+                float32x4_t scales0 = vcvt_f32_f16(scales0_f16);
+                float32x4_t scales1 = vcvt_f32_f16(scales1_f16);
+
+                running_sum = vmlaq_f32(running_sum, vcvtq_f32_s32(acc0), scales0);
+                running_sum = vmlaq_f32(running_sum, vcvtq_f32_s32(acc1), scales1);
+            }
+
+            for (; g < num_groups; g++) {
+                const size_t k_base = g * group_size;
+                const int8_t* a_ptr = A + k_base;
+                const uint8_t* b_base = B_packed + (n_block * K + k_base) * 2;
+
+                int32x4_t acc = vdupq_n_s32(0);
+
+                int8x16_t a_vec = vld1q_s8(a_ptr);
+                int8x16_t b0 = unpack_16_nibbles(b_base);
+                int8x16_t b1 = unpack_16_nibbles(b_base + 8);
+                int8x16_t b2 = unpack_16_nibbles(b_base + 16);
+                int8x16_t b3 = unpack_16_nibbles(b_base + 24);
+
+                acc = CACTUS_DOTQ_LANE(acc, b0, a_vec, 0);
+                acc = CACTUS_DOTQ_LANE(acc, b1, a_vec, 1);
+                acc = CACTUS_DOTQ_LANE(acc, b2, a_vec, 2);
+                acc = CACTUS_DOTQ_LANE(acc, b3, a_vec, 3);
+
+                a_vec = vld1q_s8(a_ptr + 16);
+                b0 = unpack_16_nibbles(b_base + 32);
+                b1 = unpack_16_nibbles(b_base + 40);
+                b2 = unpack_16_nibbles(b_base + 48);
+                b3 = unpack_16_nibbles(b_base + 56);
+
+                acc = CACTUS_DOTQ_LANE(acc, b0, a_vec, 0);
+                acc = CACTUS_DOTQ_LANE(acc, b1, a_vec, 1);
+                acc = CACTUS_DOTQ_LANE(acc, b2, a_vec, 2);
+                acc = CACTUS_DOTQ_LANE(acc, b3, a_vec, 3);
+
+                const __fp16* scale_ptr = B_scales + (n_block * num_groups + g) * 4;
+                float16x4_t scales_f16 = vld1_f16(scale_ptr);
+                float32x4_t scales = vcvt_f32_f16(scales_f16);
+
+                running_sum = vmlaq_f32(running_sum, vcvtq_f32_s32(acc), scales);
+            }
+
+            float32x4_t result = vmulq_n_f32(running_sum, A_scale);
+            float16x4_t result_f16 = vcvt_f16_f32(result);
+
+            if (actual_n == 4) {
+                vst1_f16(C + n_start, result_f16);
+            } else {
+                for (size_t ni = 0; ni < actual_n; ni++) {
+                    C[n_start + ni] = vget_lane_f16(result_f16, 0);
+                    result_f16 = vext_f16(result_f16, result_f16, 1);
+                }
+            }
+        }
+    };
+
+    auto& pool = CactusThreading::get_thread_pool();
+    size_t num_threads = CactusThreading::GemmThreading::get_gemv_threads(N_blocks, pool.num_workers());
+    pool.enqueue_n_threads(N_blocks, num_threads, process_blocks);
+    pool.wait_all();
+}
+
+void cactus_matmul_int4(const int8_t* A, const float* A_scales,
+                        const uint8_t* B_packed, const __fp16* B_scales,
+                        __fp16* C, size_t M, size_t K, size_t N, size_t group_size) {
+    if (M == 1) {
+        cactus_gemv_int4(A, A_scales[0], B_packed, B_scales, C, K, N, group_size);
+    } else {
+        throw std::runtime_error("cactus_matmul_int4 for M > 1 not yet implemented");
+    }
+}
+

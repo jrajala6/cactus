@@ -631,7 +631,7 @@ void CactusGraph::execute(const std::string& profile_file) {
                     if (bin_file.is_open()) {
                         size_t bytes_to_write = buffer.byte_size;
                         if (truncated) {
-                             bytes_to_write = buffer.total_size * PrecisionTraits::size_of(buffer.precision);
+                             bytes_to_write = PrecisionTraits::packed_size_of(buffer.precision, buffer.total_size);
                         }
                         bin_file.write(reinterpret_cast<const char*>(data_ptr), bytes_to_write);
                     }
