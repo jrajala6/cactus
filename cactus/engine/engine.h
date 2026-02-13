@@ -722,11 +722,16 @@ namespace index {
         std::vector<float> embedding;
         std::string content;
         std::string metadata;
+
+        Document(int id, std::vector<float> emb, std::string cont, std::string meta)
+            : id(id), embedding(std::move(emb)), content(std::move(cont)), metadata(std::move(meta)) {}
     };
 
     struct QueryResult {
         int doc_id;
         float score;
+
+        QueryResult(int doc_id, float score) : doc_id(doc_id), score(score) {}
     };
 
     struct QueryOptions {
