@@ -479,30 +479,28 @@ void cactus_matmul_int8(
     }
 }
 
-vvoid cactus_gemv_int4(
+static inline void unpack_int4_as_int8x16x2(const uint8_t* ptr, int8x16_t& low_decoded, int8x16_t& high_decoded) {
+    int8x16_t packed = vreinterpretq_s8_u8(vld1q_u8(ptr));
+    low_decoded = vshrq_n_s8(vshlq_n_s8(packed, 4), 4);
+    high_decoded = vshrq_n_s8(packed, 4);
+}
+
+void cactus_gemv_int4(
     const int8_t* A,
     const float A_scale,
-    const uint8_t* B_packed,
+    const int8_t* B_packed_raw,
     const __fp16* B_scales,
     __fp16* C,
     size_t K, size_t N,
     size_t group_size
 ) {
+    const uint8_t* B_packed = reinterpret_cast<const uint8_t*>(B_packed_raw);
     if (K == 0 || N == 0) return;
 
     const size_t num_groups = K / group_size;
     const size_t N_blocks = (N + 3) / 4;
 
-    auto unpack_16_nibbles = [](const uint8_t* ptr) {
-        uint8x8_t packed = vld1_u8(ptr);
-        uint8x8_t lo = vand_u8(packed, vdup_n_u8(0x0F));
-        uint8x8_t hi = vshr_n_u8(packed, 4);
-        int8x8_t lo_s = vsub_s8(vreinterpret_s8_u8(lo), vdup_n_s8(8));
-        int8x8_t hi_s = vsub_s8(vreinterpret_s8_u8(hi), vdup_n_s8(8));
-        return vcombine_s8(lo_s, hi_s);
-    };
-
-    auto process_blocks = [=](<size_t block_start, size_t block_end>) {
+    auto process_blocks = [=](size_t block_start, size_t block_end) {
         for (size_t n_block = block_start; n_block < block_end; ++n_block) {
             const size_t n_start = n_block * 4;
             const size_t actual_n = std::min(size_t(4), N - n_start);
@@ -526,10 +524,9 @@ vvoid cactus_gemv_int4(
 
                 {
                     int8x16_t a_vec = vld1q_s8(a_ptr0);
-                    int8x16_t b0 = unpack_16_nibbles(b_base0);
-                    int8x16_t b1 = unpack_16_nibbles(b_base0 + 8);
-                    int8x16_t b2 = unpack_16_nibbles(b_base0 + 16);
-                    int8x16_t b3 = unpack_16_nibbles(b_base0 + 24);
+                    int8x16_t b0, b1, b2, b3;
+                    unpack_int4_as_int8x16x2(b_base0, b0, b1);
+                    unpack_int4_as_int8x16x2(b_base0 + 16, b2, b3);
 
                     acc0 = CACTUS_DOTQ_LANE(acc0, b0, a_vec, 0);
                     acc0 = CACTUS_DOTQ_LANE(acc0, b1, a_vec, 1);
@@ -537,10 +534,8 @@ vvoid cactus_gemv_int4(
                     acc0 = CACTUS_DOTQ_LANE(acc0, b3, a_vec, 3);
 
                     a_vec = vld1q_s8(a_ptr0 + 16);
-                    b0 = unpack_16_nibbles(b_base0 + 32);
-                    b1 = unpack_16_nibbles(b_base0 + 40);
-                    b2 = unpack_16_nibbles(b_base0 + 48);
-                    b3 = unpack_16_nibbles(b_base0 + 56);
+                    unpack_int4_as_int8x16x2(b_base0 + 32, b0, b1);
+                    unpack_int4_as_int8x16x2(b_base0 + 48, b2, b3);
 
                     acc0 = CACTUS_DOTQ_LANE(acc0, b0, a_vec, 0);
                     acc0 = CACTUS_DOTQ_LANE(acc0, b1, a_vec, 1);
@@ -548,13 +543,11 @@ vvoid cactus_gemv_int4(
                     acc0 = CACTUS_DOTQ_LANE(acc0, b3, a_vec, 3);
                 }
 
-                // --- GROUP 1 (Second half of the pair) ---
                 {
                     int8x16_t a_vec = vld1q_s8(a_ptr1);
-                    int8x16_t b0 = unpack_16_nibbles(b_base1);
-                    int8x16_t b1 = unpack_16_nibbles(b_base1 + 8);
-                    int8x16_t b2 = unpack_16_nibbles(b_base1 + 16);
-                    int8x16_t b3 = unpack_16_nibbles(b_base1 + 24);
+                    int8x16_t b0, b1, b2, b3;
+                    unpack_int4_as_int8x16x2(b_base1, b0, b1);
+                    unpack_int4_as_int8x16x2(b_base1 + 16, b2, b3);
 
                     acc1 = CACTUS_DOTQ_LANE(acc1, b0, a_vec, 0);
                     acc1 = CACTUS_DOTQ_LANE(acc1, b1, a_vec, 1);
@@ -562,10 +555,8 @@ vvoid cactus_gemv_int4(
                     acc1 = CACTUS_DOTQ_LANE(acc1, b3, a_vec, 3);
 
                     a_vec = vld1q_s8(a_ptr1 + 16);
-                    b0 = unpack_16_nibbles(b_base1 + 32);
-                    b1 = unpack_16_nibbles(b_base1 + 40);
-                    b2 = unpack_16_nibbles(b_base1 + 48);
-                    b3 = unpack_16_nibbles(b_base1 + 56);
+                    unpack_int4_as_int8x16x2(b_base1 + 32, b0, b1);
+                    unpack_int4_as_int8x16x2(b_base1 + 48, b2, b3);
 
                     acc1 = CACTUS_DOTQ_LANE(acc1, b0, a_vec, 0);
                     acc1 = CACTUS_DOTQ_LANE(acc1, b1, a_vec, 1);
@@ -593,10 +584,9 @@ vvoid cactus_gemv_int4(
                 int32x4_t acc = vdupq_n_s32(0);
 
                 int8x16_t a_vec = vld1q_s8(a_ptr);
-                int8x16_t b0 = unpack_16_nibbles(b_base);
-                int8x16_t b1 = unpack_16_nibbles(b_base + 8);
-                int8x16_t b2 = unpack_16_nibbles(b_base + 16);
-                int8x16_t b3 = unpack_16_nibbles(b_base + 24);
+                int8x16_t b0, b1, b2, b3;
+                unpack_int4_as_int8x16x2(b_base, b0, b1);
+                unpack_int4_as_int8x16x2(b_base + 16, b2, b3);
 
                 acc = CACTUS_DOTQ_LANE(acc, b0, a_vec, 0);
                 acc = CACTUS_DOTQ_LANE(acc, b1, a_vec, 1);
@@ -604,10 +594,8 @@ vvoid cactus_gemv_int4(
                 acc = CACTUS_DOTQ_LANE(acc, b3, a_vec, 3);
 
                 a_vec = vld1q_s8(a_ptr + 16);
-                b0 = unpack_16_nibbles(b_base + 32);
-                b1 = unpack_16_nibbles(b_base + 40);
-                b2 = unpack_16_nibbles(b_base + 48);
-                b3 = unpack_16_nibbles(b_base + 56);
+                unpack_int4_as_int8x16x2(b_base + 32, b0, b1);
+                unpack_int4_as_int8x16x2(b_base + 48, b2, b3);
 
                 acc = CACTUS_DOTQ_LANE(acc, b0, a_vec, 0);
                 acc = CACTUS_DOTQ_LANE(acc, b1, a_vec, 1);
@@ -642,12 +630,15 @@ vvoid cactus_gemv_int4(
 }
 
 void cactus_matmul_int4(const int8_t* A, const float* A_scales,
-                        const uint8_t* B_packed, const __fp16* B_scales,
+                        const int8_t* B_packed, const __fp16* B_scales,
                         __fp16* C, size_t M, size_t K, size_t N, size_t group_size) {
     if (M == 1) {
         cactus_gemv_int4(A, A_scales[0], B_packed, B_scales, C, K, N, group_size);
     } else {
-        throw std::runtime_error("cactus_matmul_int4 for M > 1 not yet implemented");
+        // Fallback: row-by-row GEMV (INT4 planar packing prevents direct INT8 GEMM reuse)
+        for (size_t m = 0; m < M; m++) {
+            cactus_gemv_int4(A + m * K, A_scales[m], B_packed, B_scales, C + m * N, K, N, group_size);
+        }
     }
 }
 

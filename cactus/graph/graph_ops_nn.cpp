@@ -155,13 +155,13 @@ void compute_matmul_node(GraphNode& node, const std::vector<std::unique_ptr<Grap
     const bool lhs_is_prequantized_int8 = (lhs_buffer.precision == Precision::INT8 &&
                                             lhs_buffer.has_activation_scales());
 
-    if (rhs_buffer.is_grouped_int8()) {
+    if (rhs_buffer.is_grouped_int8() || rhs_buffer.is_grouped_int4()) {
         const int8_t* rhs = rhs_buffer.data_as<int8_t>();
         const __fp16* rhs_scales = rhs_buffer.scales_as_fp16();
         __fp16* output = node.output_buffer.data_as<__fp16>();
 
         if (!pretransposed_rhs) {
-            throw std::runtime_error("Group-wise INT8 matmul requires pretransposed weights");
+            throw std::runtime_error("Group-wise quantized matmul requires pretransposed weights");
         }
 
         const int8_t* lhs_int8;
@@ -178,12 +178,18 @@ void compute_matmul_node(GraphNode& node, const std::vector<std::unique_ptr<Grap
             lhs_int8 = quant_activation_buffer.data();
             lhs_scales = quant_scales_buffer.data();
         } else {
-            throw std::runtime_error("INT8 matmul requires INT8 (pre-quantized) or FP16 activations");
+            throw std::runtime_error("Quantized matmul requires INT8 (pre-quantized) or FP16 activations");
         }
 
-        cactus_matmul_int8(lhs_int8, lhs_scales,
-                           rhs, rhs_scales, output,
-                           M, K, N, rhs_buffer.group_size);
+        if (rhs_buffer.is_grouped_int4()) {
+            cactus_matmul_int4(lhs_int8, lhs_scales,
+                               rhs, rhs_scales, output,
+                               M, K, N, rhs_buffer.group_size);
+        } else {
+            cactus_matmul_int8(lhs_int8, lhs_scales,
+                               rhs, rhs_scales, output,
+                               M, K, N, rhs_buffer.group_size);
+        }
 
     } else {
         if (lhs_buffer.precision != Precision::FP16) {

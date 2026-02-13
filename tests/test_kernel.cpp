@@ -329,6 +329,146 @@ bool test_matmul_int8_grouped_correctness() {
     return max_abs_error < 0.1f;
 }
 
+bool test_gemv_int4_correctness() {
+    const size_t K = 128, N = 8;
+    const size_t group_size = 32;
+    const size_t num_groups = K / group_size;
+    const size_t BLOCK_SIZE = 4;
+
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+
+    // Generate random FP16 activations (single vector, length K)
+    std::vector<__fp16> A_fp16(K);
+    for (size_t i = 0; i < K; ++i) {
+        A_fp16[i] = static_cast<__fp16>(dis(gen));
+    }
+
+    // Generate random FP16 weights (N x K) and quantize to INT4
+    std::vector<float> B_fp32(N * K);
+    std::vector<int8_t> B_int4(N * K);
+    std::vector<float> B_scales_fp32(N * num_groups);
+
+    for (size_t i = 0; i < N * K; ++i) {
+        B_fp32[i] = dis(gen);
+    }
+
+    // Group-wise INT4 quantization: scale = max_abs / 7.0, clamp to [-8, 7]
+    for (size_t n = 0; n < N; ++n) {
+        for (size_t g = 0; g < num_groups; ++g) {
+            float max_abs = 0.0f;
+            for (size_t k = 0; k < group_size; ++k) {
+                float val = std::abs(B_fp32[n * K + g * group_size + k]);
+                if (val > max_abs) max_abs = val;
+            }
+            float scale = max_abs / 7.0f;
+            if (scale < 1e-10f) scale = 1e-10f;
+            B_scales_fp32[n * num_groups + g] = scale;
+
+            for (size_t k = 0; k < group_size; ++k) {
+                float val = B_fp32[n * K + g * group_size + k] / scale;
+                int32_t q = static_cast<int32_t>(std::round(val));
+                q = std::max(-8, std::min(7, q));
+                B_int4[n * K + g * group_size + k] = static_cast<int8_t>(q);
+            }
+        }
+    }
+
+    // Interleave weights: [N, K] -> [N/4, K/4, 4, 4] flattened
+    // Matches tensor_io.py interleave_weights()
+    size_t N_blocks = N / BLOCK_SIZE;
+    size_t K_blocks = K / BLOCK_SIZE;
+    std::vector<int8_t> B_interleaved(N * K);
+    for (size_t n_blk = 0; n_blk < N_blocks; ++n_blk) {
+        for (size_t k_blk = 0; k_blk < K_blocks; ++k_blk) {
+            for (size_t ni = 0; ni < BLOCK_SIZE; ++ni) {
+                for (size_t ki = 0; ki < BLOCK_SIZE; ++ki) {
+                    size_t src_n = n_blk * BLOCK_SIZE + ni;
+                    size_t src_k = k_blk * BLOCK_SIZE + ki;
+                    size_t dst_idx = (n_blk * K_blocks + k_blk) * (BLOCK_SIZE * BLOCK_SIZE) +
+                                     ni * BLOCK_SIZE + ki;
+                    B_interleaved[dst_idx] = B_int4[src_n * K + src_k];
+                }
+            }
+        }
+    }
+
+    // Planar INT4 packing: groups of 32 values -> 16 packed bytes
+    // First 16 values -> low nibbles, next 16 -> high nibbles
+    // Matches tensor_io.py pack_int4_pairs()
+    size_t num_packed_bytes = N * K / 2;
+    std::vector<uint8_t> B_packed(num_packed_bytes);
+    for (size_t i = 0; i < N * K; i += 32) {
+        for (size_t j = 0; j < 16; ++j) {
+            uint8_t lo = static_cast<uint8_t>(B_interleaved[i + j]) & 0x0F;
+            uint8_t hi = (static_cast<uint8_t>(B_interleaved[i + 16 + j]) & 0x0F) << 4;
+            B_packed[i / 2 + j] = lo | hi;
+        }
+    }
+
+    // Interleave scales: [N, num_groups] -> [N/4, num_groups, 4] flattened
+    // Matches tensor_io.py interleave_scales()
+    std::vector<__fp16> B_scales_interleaved(N * num_groups);
+    for (size_t n_blk = 0; n_blk < N_blocks; ++n_blk) {
+        for (size_t g = 0; g < num_groups; ++g) {
+            for (size_t ni = 0; ni < BLOCK_SIZE; ++ni) {
+                size_t src_n = n_blk * BLOCK_SIZE + ni;
+                size_t dst_idx = (n_blk * num_groups + g) * BLOCK_SIZE + ni;
+                B_scales_interleaved[dst_idx] = static_cast<__fp16>(B_scales_fp32[src_n * num_groups + g]);
+            }
+        }
+    }
+
+    // Quantize activations to INT8
+    float a_max_abs = 0.0f;
+    for (size_t k = 0; k < K; ++k) {
+        float val = std::abs(static_cast<float>(A_fp16[k]));
+        if (val > a_max_abs) a_max_abs = val;
+    }
+    float a_scale = a_max_abs / 127.0f;
+    if (a_scale < 1e-10f) a_scale = 1e-10f;
+
+    std::vector<int8_t> A_quant(K);
+    for (size_t k = 0; k < K; ++k) {
+        float val = static_cast<float>(A_fp16[k]) / a_scale;
+        int32_t q = static_cast<int32_t>(std::round(val));
+        q = std::max(-128, std::min(127, q));
+        A_quant[k] = static_cast<int8_t>(q);
+    }
+
+    // Run INT4 GEMV kernel
+    std::vector<__fp16> C(N);
+    cactus_gemv_int4(A_quant.data(), a_scale,
+                     reinterpret_cast<const int8_t*>(B_packed.data()),
+                     B_scales_interleaved.data(),
+                     C.data(), K, N, group_size);
+
+    // Compute reference: for each output n, sum over groups of
+    // (a_scale * b_scale * sum_k(A_quant[k] * B_int4[n,k]))
+    std::vector<float> C_ref(N, 0.0f);
+    for (size_t n = 0; n < N; ++n) {
+        for (size_t g = 0; g < num_groups; ++g) {
+            float b_scale = B_scales_fp32[n * num_groups + g];
+            int32_t group_sum = 0;
+            for (size_t k = 0; k < group_size; ++k) {
+                size_t k_idx = g * group_size + k;
+                group_sum += static_cast<int32_t>(A_quant[k_idx]) *
+                             static_cast<int32_t>(B_int4[n * K + k_idx]);
+            }
+            C_ref[n] += static_cast<float>(group_sum) * a_scale * b_scale;
+        }
+    }
+
+    float max_abs_error = 0.0f;
+    for (size_t n = 0; n < N; ++n) {
+        float error = std::abs(static_cast<float>(C[n]) - C_ref[n]);
+        if (error > max_abs_error) max_abs_error = error;
+    }
+
+    std::cout << "  INT4 GEMV max abs error: " << max_abs_error << std::endl;
+    return max_abs_error < 0.1f;
+}
+
 int main() {
     TestUtils::TestRunner runner("Kernel Backend Tests");
 
@@ -342,6 +482,7 @@ int main() {
     runner.run_test("Kernel RoPE Correctness", test_neon_rope_correctness());
     runner.run_test("Kernel Attention FP16 Correctness", test_neon_attention_fp16_correctness());
     runner.run_test("Kernel Grouped INT8 MatMul Correctness", test_matmul_int8_grouped_correctness());
+    runner.run_test("Kernel INT4 GEMV Correctness", test_gemv_int4_correctness());
 
     runner.print_summary();
     return runner.all_passed() ? 0 : 1;

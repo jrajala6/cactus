@@ -91,20 +91,24 @@ def interleave_scales(scales: np.ndarray, block_size: int = INTERLEAVE_BLOCK) ->
 
 
 def pack_int4_pairs(data: np.ndarray) -> np.ndarray:
-    """Pack pairs of INT4 values (stored as int8) into single bytes.
+    """Pack INT4 values (stored as int8) into bytes using planar layout.
 
-    Input: array of int8 values in range [-8, 7]
-    Output: array of uint8 with half the length, each byte containing two packed int4 values
+    Input: array of int8 values in range [-8, 7], length must be a multiple of 32
+    Output: array of uint8 with half the length
 
-    Packing format: low nibble = first value, high nibble = second value
+    Packing format (planar, groups of 32):
+      For each group of 32 values, the first 16 are stored in the low nibbles
+      and the next 16 in the high nibbles of 16 consecutive bytes.
+      This matches unpack_int4_as_int8x16x2 which extracts low/high nibbles
+      of a 16-byte NEON load into two separate int8x16 vectors.
     """
-    assert len(data) % 2 == 0, "Data length must be even for INT4 packing"
+    assert len(data) % 32 == 0, "Data length must be a multiple of 32 for INT4 planar packing"
 
-    pairs = data.reshape(-1, 2)
-    low = pairs[:, 0].astype(np.uint8) & 0x0F
-    high = (pairs[:, 1].astype(np.uint8) & 0x0F) << 4
+    groups = data.reshape(-1, 32)
+    low = groups[:, :16].astype(np.uint8) & 0x0F
+    high = (groups[:, 16:].astype(np.uint8) & 0x0F) << 4
 
-    return (low | high).astype(np.uint8)
+    return (low | high).astype(np.uint8).reshape(-1)
 
 
 def save_tensor_with_header(tensor, output_path, precision='INT8', transpose=False, stats_tracker=None, args=None, model_type=None):
