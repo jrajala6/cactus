@@ -2,6 +2,7 @@ import numpy as np
 import struct
 from pathlib import Path
 from typing import Optional, Dict, Any, List
+from .weight_patterns import EMBED_NAMES
 
 try:
     import torch
@@ -146,6 +147,8 @@ def save_tensor_with_header(tensor, output_path, precision='INT8', transpose=Fal
         filename = output_path.name
         if any(x in filename for x in ['norm', 'bias', 'vision', 'position_embeddings', 'embed_positions']):
             precision = 'FP16'
+        elif precision == 'INT4' and any(x in filename for x in EMBED_NAMES):
+            precision = 'INT8'
 
     shape = list(data.shape)
     if transpose and len(shape) == 2:
