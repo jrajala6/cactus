@@ -428,16 +428,16 @@ void cactus_gemm_int8(
                         int32x4_t acc = vdupq_n_s32(0);
 
                         int8x16_t a_vec = vld1q_s8(a_ptr);
-                        acc = CACTUS_DOTQ_LANE(acc, b00, a_vec, 0);
                         acc = CACTUS_DOTQ_LANE(acc, b01, a_vec, 1);
-                        acc = CACTUS_DOTQ_LANE(acc, b02, a_vec, 2);
+                        acc = CACTUS_DOTQ_LANE(acc, b00, a_vec, 0);
                         acc = CACTUS_DOTQ_LANE(acc, b03, a_vec, 3);
+                        acc = CACTUS_DOTQ_LANE(acc, b02, a_vec, 2);
 
                         a_vec = vld1q_s8(a_ptr + 16);
-                        acc = CACTUS_DOTQ_LANE(acc, b10, a_vec, 0);
                         acc = CACTUS_DOTQ_LANE(acc, b11, a_vec, 1);
-                        acc = CACTUS_DOTQ_LANE(acc, b12, a_vec, 2);
+                        acc = CACTUS_DOTQ_LANE(acc, b10, a_vec, 0);
                         acc = CACTUS_DOTQ_LANE(acc, b13, a_vec, 3);
+                        acc = CACTUS_DOTQ_LANE(acc, b12, a_vec, 2);
 
                         running_sum[mi] = vmlaq_f32(running_sum[mi], vcvtq_f32_s32(acc), scales);
                     }
@@ -479,10 +479,10 @@ void cactus_matmul_int8(
     }
 }
 
-static inline void unpack_int4_as_int8x16x2(const uint8_t* ptr, int8x16_t& low_decoded, int8x16_t& high_decoded) {
+static inline void unpack_int4_as_int8x16x2(const uint8_t* ptr, int8x16_t& high_decoded, int8x16_t& low_decoded) {
     int8x16_t packed = vreinterpretq_s8_u8(vld1q_u8(ptr));
-    low_decoded = vshrq_n_s8(vshlq_n_s8(packed, 4), 4);
     high_decoded = vshrq_n_s8(packed, 4);
+    low_decoded = vshrq_n_s8(vshlq_n_s8(packed, 4), 4);
 }
 
 void cactus_gemv_int4(
@@ -525,19 +525,19 @@ void cactus_gemv_int4(
                 {
                     int8x16_t a_vec = vld1q_s8(a_ptr0);
                     int8x16_t b0, b1, b2, b3;
-                    unpack_int4_as_int8x16x2(b_base0, b0, b1);
-                    unpack_int4_as_int8x16x2(b_base0 + 16, b2, b3);
+                    unpack_int4_as_int8x16x2(b_base0, b1, b0);
 
                     acc0 = CACTUS_DOTQ_LANE(acc0, b0, a_vec, 0);
+                    unpack_int4_as_int8x16x2(b_base0 + 16, b3, b2);
                     acc0 = CACTUS_DOTQ_LANE(acc0, b1, a_vec, 1);
                     acc0 = CACTUS_DOTQ_LANE(acc0, b2, a_vec, 2);
                     acc0 = CACTUS_DOTQ_LANE(acc0, b3, a_vec, 3);
 
                     a_vec = vld1q_s8(a_ptr0 + 16);
-                    unpack_int4_as_int8x16x2(b_base0 + 32, b0, b1);
-                    unpack_int4_as_int8x16x2(b_base0 + 48, b2, b3);
+                    unpack_int4_as_int8x16x2(b_base0 + 32, b1, b0);
 
                     acc0 = CACTUS_DOTQ_LANE(acc0, b0, a_vec, 0);
+                    unpack_int4_as_int8x16x2(b_base0 + 48, b3, b2);
                     acc0 = CACTUS_DOTQ_LANE(acc0, b1, a_vec, 1);
                     acc0 = CACTUS_DOTQ_LANE(acc0, b2, a_vec, 2);
                     acc0 = CACTUS_DOTQ_LANE(acc0, b3, a_vec, 3);
@@ -546,19 +546,19 @@ void cactus_gemv_int4(
                 {
                     int8x16_t a_vec = vld1q_s8(a_ptr1);
                     int8x16_t b0, b1, b2, b3;
-                    unpack_int4_as_int8x16x2(b_base1, b0, b1);
-                    unpack_int4_as_int8x16x2(b_base1 + 16, b2, b3);
+                    unpack_int4_as_int8x16x2(b_base1, b1, b0);
 
                     acc1 = CACTUS_DOTQ_LANE(acc1, b0, a_vec, 0);
+                    unpack_int4_as_int8x16x2(b_base1 + 16, b3, b2);
                     acc1 = CACTUS_DOTQ_LANE(acc1, b1, a_vec, 1);
                     acc1 = CACTUS_DOTQ_LANE(acc1, b2, a_vec, 2);
                     acc1 = CACTUS_DOTQ_LANE(acc1, b3, a_vec, 3);
 
                     a_vec = vld1q_s8(a_ptr1 + 16);
-                    unpack_int4_as_int8x16x2(b_base1 + 32, b0, b1);
-                    unpack_int4_as_int8x16x2(b_base1 + 48, b2, b3);
+                    unpack_int4_as_int8x16x2(b_base1 + 32, b1, b0);
 
                     acc1 = CACTUS_DOTQ_LANE(acc1, b0, a_vec, 0);
+                    unpack_int4_as_int8x16x2(b_base1 + 48, b3, b2);
                     acc1 = CACTUS_DOTQ_LANE(acc1, b1, a_vec, 1);
                     acc1 = CACTUS_DOTQ_LANE(acc1, b2, a_vec, 2);
                     acc1 = CACTUS_DOTQ_LANE(acc1, b3, a_vec, 3);
@@ -585,8 +585,8 @@ void cactus_gemv_int4(
 
                 int8x16_t a_vec = vld1q_s8(a_ptr);
                 int8x16_t b0, b1, b2, b3;
-                unpack_int4_as_int8x16x2(b_base, b0, b1);
-                unpack_int4_as_int8x16x2(b_base + 16, b2, b3);
+                unpack_int4_as_int8x16x2(b_base, b1, b0);
+                unpack_int4_as_int8x16x2(b_base + 16, b3, b2);
 
                 acc = CACTUS_DOTQ_LANE(acc, b0, a_vec, 0);
                 acc = CACTUS_DOTQ_LANE(acc, b1, a_vec, 1);
@@ -594,8 +594,8 @@ void cactus_gemv_int4(
                 acc = CACTUS_DOTQ_LANE(acc, b3, a_vec, 3);
 
                 a_vec = vld1q_s8(a_ptr + 16);
-                unpack_int4_as_int8x16x2(b_base + 32, b0, b1);
-                unpack_int4_as_int8x16x2(b_base + 48, b2, b3);
+                unpack_int4_as_int8x16x2(b_base + 32, b1, b0);
+                unpack_int4_as_int8x16x2(b_base + 48, b3, b2);
 
                 acc = CACTUS_DOTQ_LANE(acc, b0, a_vec, 0);
                 acc = CACTUS_DOTQ_LANE(acc, b1, a_vec, 1);
@@ -625,8 +625,14 @@ void cactus_gemv_int4(
 
     auto& pool = CactusThreading::get_thread_pool();
     size_t num_threads = CactusThreading::GemmThreading::get_gemv_threads(N_blocks, pool.num_workers());
-    pool.enqueue_n_threads(N_blocks, num_threads, process_blocks);
-    pool.wait_all();
+    num_threads = std::min(num_threads, N_blocks);
+
+    if (num_threads <= 1) {
+        process_blocks(0, N_blocks);
+    } else {
+        pool.enqueue_n_threads(N_blocks, num_threads, process_blocks);
+        pool.wait_all();
+    }
 }
 
 
@@ -678,10 +684,10 @@ void cactus_gemm_int4(
                     int8x16_t b00, b01, b02, b03;
                     int8x16_t b10, b11, b12, b13;
 
-                    unpack_int4_as_int8x16x2(b_base, b00, b01);
-                    unpack_int4_as_int8x16x2(b_base + 16, b02, b03);
-                    unpack_int4_as_int8x16x2(b_base + 32, b10, b11);
-                    unpack_int4_as_int8x16x2(b_base + 48, b12, b13);    
+                    unpack_int4_as_int8x16x2(b_base, b01, b00);
+                    unpack_int4_as_int8x16x2(b_base + 16, b03, b02);
+                    unpack_int4_as_int8x16x2(b_base + 32, b11, b10);
+                    unpack_int4_as_int8x16x2(b_base + 48, b13, b12);
 
                     const __fp16* scale_ptr = B_scales + (n_block * num_groups + g) * 4;
                     float16x4_t scales_f16 = vld1_f16(scale_ptr);
