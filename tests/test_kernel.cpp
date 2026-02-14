@@ -400,8 +400,8 @@ bool test_gemv_int4_correctness() {
     std::vector<uint8_t> B_packed(num_packed_bytes);
     for (size_t i = 0; i < N * K; i += 32) {
         for (size_t j = 0; j < 16; ++j) {
-            uint8_t lo = static_cast<uint8_t>(B_interleaved[i + j]) & 0x0F;
-            uint8_t hi = (static_cast<uint8_t>(B_interleaved[i + 16 + j]) & 0x0F) << 4;
+            uint8_t lo = static_cast<uint8_t>((static_cast<int16_t>(B_interleaved[i + j]) + 8) & 0x0F);
+            uint8_t hi = static_cast<uint8_t>(((static_cast<int16_t>(B_interleaved[i + 16 + j]) + 8) & 0x0F) << 4);
             B_packed[i / 2 + j] = lo | hi;
         }
     }
@@ -556,8 +556,8 @@ bool test_gemm_int4_correctness() {
     std::vector<uint8_t> B_packed(num_packed_bytes);
     for (size_t i = 0; i < N * K; i += 32) {
         for (size_t j = 0; j < 16; ++j) {
-            uint8_t lo = static_cast<uint8_t>(B_interleaved[i + j]) & 0x0F;
-            uint8_t hi = (static_cast<uint8_t>(B_interleaved[i + 16 + j]) & 0x0F) << 4;
+            uint8_t lo = static_cast<uint8_t>((static_cast<int16_t>(B_interleaved[i + j]) + 8) & 0x0F);
+            uint8_t hi = static_cast<uint8_t>(((static_cast<int16_t>(B_interleaved[i + 16 + j]) + 8) & 0x0F) << 4);
             B_packed[i / 2 + j] = lo | hi;
         }
     }

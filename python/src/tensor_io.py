@@ -100,14 +100,13 @@ def pack_int4_pairs(data: np.ndarray) -> np.ndarray:
     Packing format (planar, groups of 32):
       For each group of 32 values, the first 16 are stored in the low nibbles
       and the next 16 in the high nibbles of 16 consecutive bytes.
-      This matches unpack_int4_as_int8x16x2 which extracts low/high nibbles
-      of a 16-byte NEON load into two separate int8x16 vectors.
+      Nibbles are stored in offset-binary form where u = s + 8.
     """
     assert len(data) % 32 == 0, "Data length must be a multiple of 32 for INT4 planar packing"
 
     groups = data.reshape(-1, 32)
-    low = groups[:, :16].astype(np.uint8) & 0x0F
-    high = (groups[:, 16:].astype(np.uint8) & 0x0F) << 4
+    low = ((groups[:, :16].astype(np.int16) + 8) & 0x0F).astype(np.uint8)
+    high = (((groups[:, 16:].astype(np.int16) + 8) & 0x0F).astype(np.uint8)) << 4
 
     return (low | high).astype(np.uint8).reshape(-1)
 

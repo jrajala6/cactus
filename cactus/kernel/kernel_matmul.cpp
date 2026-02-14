@@ -480,10 +480,43 @@ void cactus_matmul_int8(
 }
 
 static inline void unpack_int4_as_int8x16x2(const uint8_t* ptr, int8x16_t& high_decoded, int8x16_t& low_decoded) {
-    int8x16_t packed = vreinterpretq_s8_u8(vld1q_u8(ptr));
-    high_decoded = vshrq_n_s8(packed, 4);
-    low_decoded = vshrq_n_s8(vshlq_n_s8(packed, 4), 4);
+    uint8x16_t packed = vld1q_u8(ptr);
+    uint8x16_t high = vshrq_n_u8(packed, 4);
+    uint8x16_t low = vandq_u8(packed, vdupq_n_u8(0x0F));
+
+    // Packed INT4 uses offset-binary nibbles [0,15] where s = u - 8.
+    high_decoded = vreinterpretq_s8_u8(vsubq_u8(high, vdupq_n_u8(8)));
+    low_decoded = vreinterpretq_s8_u8(vsubq_u8(low, vdupq_n_u8(8)));
 }
+
+#ifdef __ARM_FEATURE_MATMUL_INT8
+
+static inline void unpack_int4_as_uint8x16x2(const uint8_t* ptr, uint8x16_t& high, uint8x16_t& low) {
+    uint8x16_t packed = vld1q_u8(ptr);
+    high = vshrq_n_u8(packed, 4);
+    low = vandq_u8(packed, vdupq_n_u8(0x0F));
+}
+
+static inline int32_t sum_int8_group(const int8_t* ptr) {
+    int16x8_t psum = vpaddlq_s8(vld1q_s8(ptr));
+    psum = vpadalq_s8(psum, vld1q_s8(ptr + 16));
+    int32x4_t qsum = vpaddlq_s16(psum);
+    return vaddvq_s32(qsum);
+}
+
+#define INT4_BVEC_TYPE uint8x16_t
+#define INT4_UNPACK(ptr, hi, lo) unpack_int4_as_uint8x16x2(ptr, hi, lo)
+#define INT4_DOTQ_LANE(acc, b, a, lane) vusdotq_laneq_s32(acc, b, a, lane)
+#define INT4_NEEDS_BIAS_CORRECTION 1
+
+#else
+
+#define INT4_BVEC_TYPE int8x16_t
+#define INT4_UNPACK(ptr, hi, lo) unpack_int4_as_int8x16x2(ptr, hi, lo)
+#define INT4_DOTQ_LANE(acc, b, a, lane) CACTUS_DOTQ_LANE(acc, b, a, lane)
+#define INT4_NEEDS_BIAS_CORRECTION 0
+
+#endif
 
 void cactus_gemv_int4(
     const int8_t* A,
@@ -500,6 +533,13 @@ void cactus_gemv_int4(
     const size_t num_groups = K / group_size;
     const size_t N_blocks = (N + 3) / 4;
 
+#if INT4_NEEDS_BIAS_CORRECTION
+    std::vector<int32_t> a_corrections(num_groups);
+    for (size_t g = 0; g < num_groups; g++)
+        a_corrections[g] = sum_int8_group(A + g * group_size) * 8;
+    const int32_t* a_corr_ptr = a_corrections.data();
+#endif
+
     auto process_blocks = [=](size_t block_start, size_t block_end) {
         for (size_t n_block = block_start; n_block < block_end; ++n_block) {
             const size_t n_start = n_block * 4;
@@ -513,7 +553,7 @@ void cactus_gemv_int4(
 
                 const int8_t* a_ptr0 = A + k_base0;
                 const int8_t* a_ptr1 = A + k_base1;
-                
+
                 const uint8_t* b_base0 = B_packed + (n_block * K + k_base0) * 2;
                 const uint8_t* b_base1 = B_packed + (n_block * K + k_base1) * 2;
 
@@ -524,44 +564,44 @@ void cactus_gemv_int4(
 
                 {
                     int8x16_t a_vec = vld1q_s8(a_ptr0);
-                    int8x16_t b0, b1, b2, b3;
-                    unpack_int4_as_int8x16x2(b_base0, b1, b0);
+                    INT4_BVEC_TYPE b0, b1, b2, b3;
+                    INT4_UNPACK(b_base0, b1, b0);
 
-                    acc0 = CACTUS_DOTQ_LANE(acc0, b0, a_vec, 0);
-                    unpack_int4_as_int8x16x2(b_base0 + 16, b3, b2);
-                    acc0 = CACTUS_DOTQ_LANE(acc0, b1, a_vec, 1);
-                    acc0 = CACTUS_DOTQ_LANE(acc0, b2, a_vec, 2);
-                    acc0 = CACTUS_DOTQ_LANE(acc0, b3, a_vec, 3);
+                    acc0 = INT4_DOTQ_LANE(acc0, b0, a_vec, 0);
+                    INT4_UNPACK(b_base0 + 16, b3, b2);
+                    acc0 = INT4_DOTQ_LANE(acc0, b1, a_vec, 1);
+                    acc0 = INT4_DOTQ_LANE(acc0, b2, a_vec, 2);
+                    acc0 = INT4_DOTQ_LANE(acc0, b3, a_vec, 3);
 
                     a_vec = vld1q_s8(a_ptr0 + 16);
-                    unpack_int4_as_int8x16x2(b_base0 + 32, b1, b0);
+                    INT4_UNPACK(b_base0 + 32, b1, b0);
 
-                    acc0 = CACTUS_DOTQ_LANE(acc0, b0, a_vec, 0);
-                    unpack_int4_as_int8x16x2(b_base0 + 48, b3, b2);
-                    acc0 = CACTUS_DOTQ_LANE(acc0, b1, a_vec, 1);
-                    acc0 = CACTUS_DOTQ_LANE(acc0, b2, a_vec, 2);
-                    acc0 = CACTUS_DOTQ_LANE(acc0, b3, a_vec, 3);
+                    acc0 = INT4_DOTQ_LANE(acc0, b0, a_vec, 0);
+                    INT4_UNPACK(b_base0 + 48, b3, b2);
+                    acc0 = INT4_DOTQ_LANE(acc0, b1, a_vec, 1);
+                    acc0 = INT4_DOTQ_LANE(acc0, b2, a_vec, 2);
+                    acc0 = INT4_DOTQ_LANE(acc0, b3, a_vec, 3);
                 }
 
                 {
                     int8x16_t a_vec = vld1q_s8(a_ptr1);
-                    int8x16_t b0, b1, b2, b3;
-                    unpack_int4_as_int8x16x2(b_base1, b1, b0);
+                    INT4_BVEC_TYPE b0, b1, b2, b3;
+                    INT4_UNPACK(b_base1, b1, b0);
 
-                    acc1 = CACTUS_DOTQ_LANE(acc1, b0, a_vec, 0);
-                    unpack_int4_as_int8x16x2(b_base1 + 16, b3, b2);
-                    acc1 = CACTUS_DOTQ_LANE(acc1, b1, a_vec, 1);
-                    acc1 = CACTUS_DOTQ_LANE(acc1, b2, a_vec, 2);
-                    acc1 = CACTUS_DOTQ_LANE(acc1, b3, a_vec, 3);
+                    acc1 = INT4_DOTQ_LANE(acc1, b0, a_vec, 0);
+                    INT4_UNPACK(b_base1 + 16, b3, b2);
+                    acc1 = INT4_DOTQ_LANE(acc1, b1, a_vec, 1);
+                    acc1 = INT4_DOTQ_LANE(acc1, b2, a_vec, 2);
+                    acc1 = INT4_DOTQ_LANE(acc1, b3, a_vec, 3);
 
                     a_vec = vld1q_s8(a_ptr1 + 16);
-                    unpack_int4_as_int8x16x2(b_base1 + 32, b1, b0);
+                    INT4_UNPACK(b_base1 + 32, b1, b0);
 
-                    acc1 = CACTUS_DOTQ_LANE(acc1, b0, a_vec, 0);
-                    unpack_int4_as_int8x16x2(b_base1 + 48, b3, b2);
-                    acc1 = CACTUS_DOTQ_LANE(acc1, b1, a_vec, 1);
-                    acc1 = CACTUS_DOTQ_LANE(acc1, b2, a_vec, 2);
-                    acc1 = CACTUS_DOTQ_LANE(acc1, b3, a_vec, 3);
+                    acc1 = INT4_DOTQ_LANE(acc1, b0, a_vec, 0);
+                    INT4_UNPACK(b_base1 + 48, b3, b2);
+                    acc1 = INT4_DOTQ_LANE(acc1, b1, a_vec, 1);
+                    acc1 = INT4_DOTQ_LANE(acc1, b2, a_vec, 2);
+                    acc1 = INT4_DOTQ_LANE(acc1, b3, a_vec, 3);
                 }
 
                 const __fp16* scale_ptr0 = B_scales + (n_block * num_groups + g) * 4;
@@ -572,6 +612,10 @@ void cactus_gemv_int4(
                 float32x4_t scales0 = vcvt_f32_f16(scales0_f16);
                 float32x4_t scales1 = vcvt_f32_f16(scales1_f16);
 
+#if INT4_NEEDS_BIAS_CORRECTION
+                acc0 = vsubq_s32(acc0, vdupq_n_s32(a_corr_ptr[g]));
+                acc1 = vsubq_s32(acc1, vdupq_n_s32(a_corr_ptr[g + 1]));
+#endif
                 running_sum = vmlaq_f32(running_sum, vcvtq_f32_s32(acc0), scales0);
                 running_sum = vmlaq_f32(running_sum, vcvtq_f32_s32(acc1), scales1);
             }
@@ -584,28 +628,31 @@ void cactus_gemv_int4(
                 int32x4_t acc = vdupq_n_s32(0);
 
                 int8x16_t a_vec = vld1q_s8(a_ptr);
-                int8x16_t b0, b1, b2, b3;
-                unpack_int4_as_int8x16x2(b_base, b1, b0);
-                unpack_int4_as_int8x16x2(b_base + 16, b3, b2);
+                INT4_BVEC_TYPE b0, b1, b2, b3;
+                INT4_UNPACK(b_base, b1, b0);
+                INT4_UNPACK(b_base + 16, b3, b2);
 
-                acc = CACTUS_DOTQ_LANE(acc, b0, a_vec, 0);
-                acc = CACTUS_DOTQ_LANE(acc, b1, a_vec, 1);
-                acc = CACTUS_DOTQ_LANE(acc, b2, a_vec, 2);
-                acc = CACTUS_DOTQ_LANE(acc, b3, a_vec, 3);
+                acc = INT4_DOTQ_LANE(acc, b0, a_vec, 0);
+                acc = INT4_DOTQ_LANE(acc, b1, a_vec, 1);
+                acc = INT4_DOTQ_LANE(acc, b2, a_vec, 2);
+                acc = INT4_DOTQ_LANE(acc, b3, a_vec, 3);
 
                 a_vec = vld1q_s8(a_ptr + 16);
-                unpack_int4_as_int8x16x2(b_base + 32, b1, b0);
-                unpack_int4_as_int8x16x2(b_base + 48, b3, b2);
+                INT4_UNPACK(b_base + 32, b1, b0);
+                INT4_UNPACK(b_base + 48, b3, b2);
 
-                acc = CACTUS_DOTQ_LANE(acc, b0, a_vec, 0);
-                acc = CACTUS_DOTQ_LANE(acc, b1, a_vec, 1);
-                acc = CACTUS_DOTQ_LANE(acc, b2, a_vec, 2);
-                acc = CACTUS_DOTQ_LANE(acc, b3, a_vec, 3);
+                acc = INT4_DOTQ_LANE(acc, b0, a_vec, 0);
+                acc = INT4_DOTQ_LANE(acc, b1, a_vec, 1);
+                acc = INT4_DOTQ_LANE(acc, b2, a_vec, 2);
+                acc = INT4_DOTQ_LANE(acc, b3, a_vec, 3);
 
                 const __fp16* scale_ptr = B_scales + (n_block * num_groups + g) * 4;
                 float16x4_t scales_f16 = vld1_f16(scale_ptr);
                 float32x4_t scales = vcvt_f32_f16(scales_f16);
 
+#if INT4_NEEDS_BIAS_CORRECTION
+                acc = vsubq_s32(acc, vdupq_n_s32(a_corr_ptr[g]));
+#endif
                 running_sum = vmlaq_f32(running_sum, vcvtq_f32_s32(acc), scales);
             }
 
@@ -657,6 +704,13 @@ void cactus_gemm_int4(
     const size_t num_row_tiles = (M + TILE_M - 1) / TILE_M;
     const size_t total_tiles = num_row_tiles * N_blocks;
 
+#if INT4_NEEDS_BIAS_CORRECTION
+    std::vector<int32_t> a_corrections(M * num_groups);
+    for (size_t m = 0; m < M; m++)
+        for (size_t g = 0; g < num_groups; g++)
+            a_corrections[m * num_groups + g] = sum_int8_group(A + m * K + g * group_size) * 8;
+    const int32_t* a_corr_ptr = a_corrections.data();
+#endif
 
     CactusThreading::parallel_gemm_tiles(M, total_tiles,
         [=](size_t tile_start, size_t tile_end) {
@@ -681,13 +735,13 @@ void cactus_gemm_int4(
 
                     __builtin_prefetch(b_base + group_size * 2, 0, 3);
 
-                    int8x16_t b00, b01, b02, b03;
-                    int8x16_t b10, b11, b12, b13;
+                    INT4_BVEC_TYPE b00, b01, b02, b03;
+                    INT4_BVEC_TYPE b10, b11, b12, b13;
 
-                    unpack_int4_as_int8x16x2(b_base, b01, b00);
-                    unpack_int4_as_int8x16x2(b_base + 16, b03, b02);
-                    unpack_int4_as_int8x16x2(b_base + 32, b11, b10);
-                    unpack_int4_as_int8x16x2(b_base + 48, b13, b12);
+                    INT4_UNPACK(b_base, b01, b00);
+                    INT4_UNPACK(b_base + 16, b03, b02);
+                    INT4_UNPACK(b_base + 32, b11, b10);
+                    INT4_UNPACK(b_base + 48, b13, b12);
 
                     const __fp16* scale_ptr = B_scales + (n_block * num_groups + g) * 4;
                     float16x4_t scales_f16 = vld1_f16(scale_ptr);
@@ -699,17 +753,20 @@ void cactus_gemm_int4(
                         int32x4_t acc = vdupq_n_s32(0);
 
                         int8x16_t a_vec = vld1q_s8(a_ptr);
-                        acc = CACTUS_DOTQ_LANE(acc, b00, a_vec, 0);
-                        acc = CACTUS_DOTQ_LANE(acc, b01, a_vec, 1);
-                        acc = CACTUS_DOTQ_LANE(acc, b02, a_vec, 2);
-                        acc = CACTUS_DOTQ_LANE(acc, b03, a_vec, 3);
+                        acc = INT4_DOTQ_LANE(acc, b00, a_vec, 0);
+                        acc = INT4_DOTQ_LANE(acc, b01, a_vec, 1);
+                        acc = INT4_DOTQ_LANE(acc, b02, a_vec, 2);
+                        acc = INT4_DOTQ_LANE(acc, b03, a_vec, 3);
 
                         a_vec = vld1q_s8(a_ptr + 16);
-                        acc = CACTUS_DOTQ_LANE(acc, b10, a_vec, 0);
-                        acc = CACTUS_DOTQ_LANE(acc, b11, a_vec, 1);
-                        acc = CACTUS_DOTQ_LANE(acc, b12, a_vec, 2);
-                        acc = CACTUS_DOTQ_LANE(acc, b13, a_vec, 3);
+                        acc = INT4_DOTQ_LANE(acc, b10, a_vec, 0);
+                        acc = INT4_DOTQ_LANE(acc, b11, a_vec, 1);
+                        acc = INT4_DOTQ_LANE(acc, b12, a_vec, 2);
+                        acc = INT4_DOTQ_LANE(acc, b13, a_vec, 3);
 
+#if INT4_NEEDS_BIAS_CORRECTION
+                        acc = vsubq_s32(acc, vdupq_n_s32(a_corr_ptr[(m_start + mi) * num_groups + g]));
+#endif
                         running_sum[mi] = vmlaq_f32(running_sum[mi], vcvtq_f32_s32(acc), scales);
                     }
                 }
@@ -743,4 +800,3 @@ void cactus_matmul_int4(const int8_t* A, const float* A_scales,
         cactus_gemm_int4(A, A_scales, B_packed, B_scales, C, M, K, N, group_size);
     }
 }
-

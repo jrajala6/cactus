@@ -306,18 +306,9 @@ void cactus_unpack_int4_to_int8(const uint8_t* packed, int8_t* unpacked, size_t 
                 uint8x16_t low_nibbles = vandq_u8(input, low_mask);
 
                 uint8x16_t high_nibbles = vshrq_n_u8(input, 4);
-                uint8x16_t sign_bit = vdupq_n_u8(0x08);
-                uint8x16_t sign_extend = vdupq_n_u8(0x10);
-
-                uint8x16_t low_sign = vandq_u8(low_nibbles, sign_bit);
-                uint8x16_t low_has_sign = vcgtq_u8(low_sign, vdupq_n_u8(0));
-                uint8x16_t low_correction = vandq_u8(low_has_sign, sign_extend);
-                int8x16_t low_signed = vreinterpretq_s8_u8(vsubq_u8(low_nibbles, low_correction));
-
-                uint8x16_t high_sign = vandq_u8(high_nibbles, sign_bit);
-                uint8x16_t high_has_sign = vcgtq_u8(high_sign, vdupq_n_u8(0));
-                uint8x16_t high_correction = vandq_u8(high_has_sign, sign_extend);
-                int8x16_t high_signed = vreinterpretq_s8_u8(vsubq_u8(high_nibbles, high_correction));
+                const uint8x16_t offset = vdupq_n_u8(8);
+                int8x16_t low_signed = vreinterpretq_s8_u8(vsubq_u8(low_nibbles, offset));
+                int8x16_t high_signed = vreinterpretq_s8_u8(vsubq_u8(high_nibbles, offset));
 
                 int8x16x2_t interleaved = vzipq_s8(low_signed, high_signed);
 
@@ -333,11 +324,9 @@ void cactus_unpack_int4_to_int8(const uint8_t* packed, int8_t* unpacked, size_t 
             for (size_t i = simd_end; i < end; ++i) {
                 uint8_t byte = packed[i];
 
-                int8_t low = byte & 0x0F;
-                if (low & 0x08) low |= 0xF0;  
+                int8_t low = static_cast<int8_t>((byte & 0x0F) - 8);
 
-                int8_t high = (byte >> 4) & 0x0F;
-                if (high & 0x08) high |= 0xF0; 
+                int8_t high = static_cast<int8_t>(((byte >> 4) & 0x0F) - 8);
 
                 size_t out_idx = i * 2;
                 if (out_idx < unpacked_count) {

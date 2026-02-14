@@ -24,11 +24,9 @@ namespace {
         for (size_t i = 0; i < packed_size; i++) {
             uint8_t byte = packed[i];
 
-            int8_t low = static_cast<int8_t>(byte & 0x0F);
-            if (low & 0x08) low |= 0xF0;  
+            int8_t low = static_cast<int8_t>((byte & 0x0F) - 8);
 
-            int8_t high = static_cast<int8_t>((byte >> 4) & 0x0F);
-            if (high & 0x08) high |= 0xF0;  
+            int8_t high = static_cast<int8_t>(((byte >> 4) & 0x0F) - 8);
 
             unpacked[i * 2] = low;
             unpacked[i * 2 + 1] = high;

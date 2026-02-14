@@ -136,8 +136,8 @@ std::vector<uint8_t> pack_int4_pairs(const std::vector<int8_t>& interleaved_int4
     std::vector<uint8_t> packed(interleaved_int4.size() / 2);
     for (size_t i = 0; i < interleaved_int4.size(); i += 32) {
         for (size_t j = 0; j < 16; ++j) {
-            const uint8_t lo = static_cast<uint8_t>(interleaved_int4[i + j]) & 0x0F;
-            const uint8_t hi = (static_cast<uint8_t>(interleaved_int4[i + 16 + j]) & 0x0F) << 4;
+            const uint8_t lo = static_cast<uint8_t>((static_cast<int16_t>(interleaved_int4[i + j]) + 8) & 0x0F);
+            const uint8_t hi = static_cast<uint8_t>(((static_cast<int16_t>(interleaved_int4[i + 16 + j]) + 8) & 0x0F) << 4);
             packed[i / 2 + j] = lo | hi;
         }
     }
