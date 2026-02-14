@@ -3,6 +3,7 @@ project(Cactus LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
+option(CACTUS_INT4_FAKE_FREE_UNPACK "Benchmark-only: bypass INT4 nibble unpack to estimate memory-only upside" OFF)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -57,6 +58,10 @@ else()
         __ARM_FEATURE_DOTPROD=1
         __ARM_FEATURE_MATMUL_INT8=1
     )
+endif()
+
+if(CACTUS_INT4_FAKE_FREE_UNPACK)
+    add_compile_definitions(CACTUS_INT4_FAKE_FREE_UNPACK=1)
 endif()
 
 file(GLOB ENGINE_SOURCES "engine/*.cpp")

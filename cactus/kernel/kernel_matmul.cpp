@@ -492,9 +492,15 @@ static inline void unpack_int4_as_int8x16x2(const uint8_t* ptr, int8x16_t& high_
 #ifdef __ARM_FEATURE_MATMUL_INT8
 
 static inline void unpack_int4_as_uint8x16x2(const uint8_t* ptr, uint8x16_t& high, uint8x16_t& low) {
+#if defined(CACTUS_INT4_FAKE_FREE_UNPACK) && CACTUS_INT4_FAKE_FREE_UNPACK
+    // Benchmark-only mode: model unpack as "free" by skipping nibble extraction.
+    // This intentionally changes INT4 math and is only for performance what-if analysis.
+    high = low = vld1q_u8(ptr);
+#else
     uint8x16_t packed = vld1q_u8(ptr);
     high = vshrq_n_u8(packed, 4);
     low = vandq_u8(packed, vdupq_n_u8(0x0F));
+#endif
 }
 
 static inline int32_t sum_int8_group(const int8_t* ptr) {
@@ -507,7 +513,11 @@ static inline int32_t sum_int8_group(const int8_t* ptr) {
 #define INT4_BVEC_TYPE uint8x16_t
 #define INT4_UNPACK(ptr, hi, lo) unpack_int4_as_uint8x16x2(ptr, hi, lo)
 #define INT4_DOTQ_LANE(acc, b, a, lane) vusdotq_laneq_s32(acc, b, a, lane)
+#if defined(CACTUS_INT4_FAKE_FREE_UNPACK) && CACTUS_INT4_FAKE_FREE_UNPACK
+#define INT4_NEEDS_BIAS_CORRECTION 0
+#else
 #define INT4_NEEDS_BIAS_CORRECTION 1
+#endif
 
 #else
 
