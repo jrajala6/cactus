@@ -810,3 +810,287 @@ void cactus_matmul_int4(const int8_t* A, const float* A_scales,
         cactus_gemm_int4(A, A_scales, B_packed, B_scales, C, M, K, N, group_size);
     }
 }
+
+// Co-located format: scales and packed data interleaved per group.
+// Per n_block (4 columns), per group: [4x fp16 scales (8B) | packed int4 data (group_size*2 B)]
+// Group stride = 8 + group_size * 2 (72 bytes for group_size=32)
+
+static void cactus_gemv_int4_colocated(
+    const int8_t* A,
+    const float A_scale,
+    const uint8_t* B_colocated,
+    __fp16* C,
+    size_t K, size_t N,
+    size_t group_size
+) {
+    if (K == 0 || N == 0) return;
+
+    const size_t num_groups = K / group_size;
+    const size_t N_blocks = (N + 3) / 4;
+    const size_t group_stride = 8 + group_size * 2;
+
+#if INT4_NEEDS_BIAS_CORRECTION
+    std::vector<int32_t> a_corrections(num_groups);
+    for (size_t g = 0; g < num_groups; g++)
+        a_corrections[g] = sum_int8_group(A + g * group_size) * 8;
+    const int32_t* a_corr_ptr = a_corrections.data();
+#endif
+
+    auto process_blocks = [=](size_t block_start, size_t block_end) {
+        for (size_t n_block = block_start; n_block < block_end; ++n_block) {
+            const size_t n_start = n_block * 4;
+            const size_t actual_n = std::min(size_t(4), N - n_start);
+            float32x4_t running_sum = vdupq_n_f32(0.0f);
+
+            const uint8_t* block_base = B_colocated + n_block * num_groups * group_stride;
+
+            size_t g = 0;
+            for (; g + 1 < num_groups; g += 2) {
+                const uint8_t* grp0 = block_base + g * group_stride;
+                const uint8_t* grp1 = grp0 + group_stride;
+
+                __builtin_prefetch(grp0 + group_stride * 2, 0, 3);
+                __builtin_prefetch(grp0 + group_stride * 2 + 64, 0, 3);
+                __builtin_prefetch(grp0 + group_stride * 3, 0, 3);
+
+                float16x4_t scales0_f16 = vld1_f16(reinterpret_cast<const __fp16*>(grp0));
+                float16x4_t scales1_f16 = vld1_f16(reinterpret_cast<const __fp16*>(grp1));
+                float32x4_t scales0 = vcvt_f32_f16(scales0_f16);
+                float32x4_t scales1 = vcvt_f32_f16(scales1_f16);
+
+                const uint8_t* b_data0 = grp0 + 8;
+                const uint8_t* b_data1 = grp1 + 8;
+
+                const int8_t* a_ptr0 = A + g * group_size;
+                const int8_t* a_ptr1 = A + (g + 1) * group_size;
+
+                int32x4_t acc0 = vdupq_n_s32(0);
+                int32x4_t acc1 = vdupq_n_s32(0);
+
+                {
+                    int8x16_t a_vec = vld1q_s8(a_ptr0);
+                    INT4_BVEC_TYPE b0, b1, b2, b3;
+                    INT4_UNPACK(b_data0, b1, b0);
+
+                    acc0 = INT4_DOTQ_LANE(acc0, b0, a_vec, 0);
+                    INT4_UNPACK(b_data0 + 16, b3, b2);
+                    acc0 = INT4_DOTQ_LANE(acc0, b1, a_vec, 1);
+                    acc0 = INT4_DOTQ_LANE(acc0, b2, a_vec, 2);
+                    acc0 = INT4_DOTQ_LANE(acc0, b3, a_vec, 3);
+
+                    a_vec = vld1q_s8(a_ptr0 + 16);
+                    INT4_UNPACK(b_data0 + 32, b1, b0);
+
+                    acc0 = INT4_DOTQ_LANE(acc0, b0, a_vec, 0);
+                    INT4_UNPACK(b_data0 + 48, b3, b2);
+                    acc0 = INT4_DOTQ_LANE(acc0, b1, a_vec, 1);
+                    acc0 = INT4_DOTQ_LANE(acc0, b2, a_vec, 2);
+                    acc0 = INT4_DOTQ_LANE(acc0, b3, a_vec, 3);
+                }
+
+                {
+                    int8x16_t a_vec = vld1q_s8(a_ptr1);
+                    INT4_BVEC_TYPE b0, b1, b2, b3;
+                    INT4_UNPACK(b_data1, b1, b0);
+
+                    acc1 = INT4_DOTQ_LANE(acc1, b0, a_vec, 0);
+                    INT4_UNPACK(b_data1 + 16, b3, b2);
+                    acc1 = INT4_DOTQ_LANE(acc1, b1, a_vec, 1);
+                    acc1 = INT4_DOTQ_LANE(acc1, b2, a_vec, 2);
+                    acc1 = INT4_DOTQ_LANE(acc1, b3, a_vec, 3);
+
+                    a_vec = vld1q_s8(a_ptr1 + 16);
+                    INT4_UNPACK(b_data1 + 32, b1, b0);
+
+                    acc1 = INT4_DOTQ_LANE(acc1, b0, a_vec, 0);
+                    INT4_UNPACK(b_data1 + 48, b3, b2);
+                    acc1 = INT4_DOTQ_LANE(acc1, b1, a_vec, 1);
+                    acc1 = INT4_DOTQ_LANE(acc1, b2, a_vec, 2);
+                    acc1 = INT4_DOTQ_LANE(acc1, b3, a_vec, 3);
+                }
+
+#if INT4_NEEDS_BIAS_CORRECTION
+                acc0 = vsubq_s32(acc0, vdupq_n_s32(a_corr_ptr[g]));
+                acc1 = vsubq_s32(acc1, vdupq_n_s32(a_corr_ptr[g + 1]));
+#endif
+                running_sum = vmlaq_f32(running_sum, vcvtq_f32_s32(acc0), scales0);
+                running_sum = vmlaq_f32(running_sum, vcvtq_f32_s32(acc1), scales1);
+            }
+
+            for (; g < num_groups; g++) {
+                const uint8_t* grp = block_base + g * group_stride;
+                const int8_t* a_ptr = A + g * group_size;
+
+                float16x4_t scales_f16 = vld1_f16(reinterpret_cast<const __fp16*>(grp));
+                float32x4_t scales = vcvt_f32_f16(scales_f16);
+                const uint8_t* b_data = grp + 8;
+
+                int32x4_t acc = vdupq_n_s32(0);
+
+                int8x16_t a_vec = vld1q_s8(a_ptr);
+                INT4_BVEC_TYPE b0, b1, b2, b3;
+                INT4_UNPACK(b_data, b1, b0);
+                INT4_UNPACK(b_data + 16, b3, b2);
+
+                acc = INT4_DOTQ_LANE(acc, b0, a_vec, 0);
+                acc = INT4_DOTQ_LANE(acc, b1, a_vec, 1);
+                acc = INT4_DOTQ_LANE(acc, b2, a_vec, 2);
+                acc = INT4_DOTQ_LANE(acc, b3, a_vec, 3);
+
+                a_vec = vld1q_s8(a_ptr + 16);
+                INT4_UNPACK(b_data + 32, b1, b0);
+                INT4_UNPACK(b_data + 48, b3, b2);
+
+                acc = INT4_DOTQ_LANE(acc, b0, a_vec, 0);
+                acc = INT4_DOTQ_LANE(acc, b1, a_vec, 1);
+                acc = INT4_DOTQ_LANE(acc, b2, a_vec, 2);
+                acc = INT4_DOTQ_LANE(acc, b3, a_vec, 3);
+
+#if INT4_NEEDS_BIAS_CORRECTION
+                acc = vsubq_s32(acc, vdupq_n_s32(a_corr_ptr[g]));
+#endif
+                running_sum = vmlaq_f32(running_sum, vcvtq_f32_s32(acc), scales);
+            }
+
+            float32x4_t result = vmulq_n_f32(running_sum, A_scale);
+            float16x4_t result_f16 = vcvt_f16_f32(result);
+
+            if (actual_n == 4) {
+                vst1_f16(C + n_start, result_f16);
+            } else {
+                for (size_t ni = 0; ni < actual_n; ni++) {
+                    C[n_start + ni] = vget_lane_f16(result_f16, 0);
+                    result_f16 = vext_f16(result_f16, result_f16, 1);
+                }
+            }
+        }
+    };
+
+    auto& pool = CactusThreading::get_thread_pool();
+    size_t num_threads = CactusThreading::GemmThreading::get_gemv_threads(N_blocks, pool.num_workers());
+    num_threads = std::min(num_threads, N_blocks);
+
+    if (num_threads <= 1) {
+        process_blocks(0, N_blocks);
+    } else {
+        pool.enqueue_n_threads(N_blocks, num_threads, process_blocks);
+        pool.wait_all();
+    }
+}
+
+static void cactus_gemm_int4_colocated(
+    const int8_t* A,
+    const float* A_scales,
+    const uint8_t* B_colocated,
+    __fp16* C,
+    size_t M, size_t K, size_t N,
+    size_t group_size
+) {
+    if (M == 0 || K == 0 || N == 0) return;
+
+    constexpr size_t TILE_M = 4;
+    constexpr size_t TILE_N = 4;
+
+    const size_t num_groups = K / group_size;
+    const size_t N_blocks = (N + TILE_N - 1) / TILE_N;
+    const size_t num_row_tiles = (M + TILE_M - 1) / TILE_M;
+    const size_t total_tiles = num_row_tiles * N_blocks;
+    const size_t group_stride = 8 + group_size * 2;
+
+#if INT4_NEEDS_BIAS_CORRECTION
+    std::vector<int32_t> a_corrections(M * num_groups);
+    for (size_t m = 0; m < M; m++)
+        for (size_t g = 0; g < num_groups; g++)
+            a_corrections[m * num_groups + g] = sum_int8_group(A + m * K + g * group_size) * 8;
+    const int32_t* a_corr_ptr = a_corrections.data();
+#endif
+
+    CactusThreading::parallel_gemm_tiles(M, total_tiles,
+        [=](size_t tile_start, size_t tile_end) {
+            for (size_t tile_idx = tile_start; tile_idx < tile_end; ++tile_idx) {
+                const size_t tile_row = tile_idx / N_blocks;
+                const size_t n_block = tile_idx % N_blocks;
+                const size_t m_start = tile_row * TILE_M;
+                const size_t m_end = std::min(m_start + TILE_M, M);
+                const size_t n_start = n_block * TILE_N;
+                const size_t n_end = std::min(n_start + TILE_N, N);
+                const size_t actual_m = m_end - m_start;
+                const size_t actual_n = n_end - n_start;
+
+                float32x4_t running_sum[TILE_M] = {
+                    vdupq_n_f32(0.0f), vdupq_n_f32(0.0f),
+                    vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)
+                };
+
+                const uint8_t* block_base = B_colocated + n_block * num_groups * group_stride;
+
+                for (size_t g = 0; g < num_groups; g++) {
+                    const uint8_t* grp = block_base + g * group_stride;
+
+                    __builtin_prefetch(grp + group_stride * 2, 0, 3);
+
+                    float16x4_t scales_f16 = vld1_f16(reinterpret_cast<const __fp16*>(grp));
+                    float32x4_t scales = vcvt_f32_f16(scales_f16);
+                    const uint8_t* b_data = grp + 8;
+
+                    INT4_BVEC_TYPE b00, b01, b02, b03;
+                    INT4_BVEC_TYPE b10, b11, b12, b13;
+
+                    INT4_UNPACK(b_data, b01, b00);
+                    INT4_UNPACK(b_data + 16, b03, b02);
+                    INT4_UNPACK(b_data + 32, b11, b10);
+                    INT4_UNPACK(b_data + 48, b13, b12);
+
+                    for (size_t mi = 0; mi < actual_m; mi++) {
+                        const int8_t* a_ptr = A + (m_start + mi) * K + g * group_size;
+
+                        int32x4_t acc = vdupq_n_s32(0);
+
+                        int8x16_t a_vec = vld1q_s8(a_ptr);
+                        acc = INT4_DOTQ_LANE(acc, b00, a_vec, 0);
+                        acc = INT4_DOTQ_LANE(acc, b01, a_vec, 1);
+                        acc = INT4_DOTQ_LANE(acc, b02, a_vec, 2);
+                        acc = INT4_DOTQ_LANE(acc, b03, a_vec, 3);
+
+                        a_vec = vld1q_s8(a_ptr + 16);
+                        acc = INT4_DOTQ_LANE(acc, b10, a_vec, 0);
+                        acc = INT4_DOTQ_LANE(acc, b11, a_vec, 1);
+                        acc = INT4_DOTQ_LANE(acc, b12, a_vec, 2);
+                        acc = INT4_DOTQ_LANE(acc, b13, a_vec, 3);
+
+#if INT4_NEEDS_BIAS_CORRECTION
+                        acc = vsubq_s32(acc, vdupq_n_s32(a_corr_ptr[(m_start + mi) * num_groups + g]));
+#endif
+                        running_sum[mi] = vmlaq_f32(running_sum[mi], vcvtq_f32_s32(acc), scales);
+                    }
+                }
+
+                for (size_t mi = 0; mi < actual_m; mi++) {
+                    const float a_scale = A_scales[m_start + mi];
+                    float32x4_t result = vmulq_n_f32(running_sum[mi], a_scale);
+                    float16x4_t result_f16 = vcvt_f16_f32(result);
+
+                    if (actual_n == 4) {
+                        vst1_f16(C + (m_start + mi) * N + n_start, result_f16);
+                    } else {
+                        for (size_t ni = 0; ni < actual_n; ni++) {
+                            C[(m_start + mi) * N + n_start + ni] = vget_lane_f16(result_f16, 0);
+                            result_f16 = vext_f16(result_f16, result_f16, 1);
+                        }
+                    }
+                }
+            }
+        });
+}
+
+void cactus_matmul_int4_colocated(const int8_t* A, const float* A_scales,
+                                   const uint8_t* B_colocated,
+                                   __fp16* C, size_t M, size_t K, size_t N, size_t group_size) {
+    if (M == 0 || K == 0 || N == 0) return;
+
+    if (M == 1) {
+        cactus_gemv_int4_colocated(A, A_scales[0], B_colocated, C, K, N, group_size);
+    } else {
+        cactus_gemm_int4_colocated(A, A_scales, B_colocated, C, M, K, N, group_size);
+    }
+}

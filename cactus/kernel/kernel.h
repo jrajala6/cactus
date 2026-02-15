@@ -63,6 +63,10 @@ void cactus_matmul_int4(const int8_t* A, const float* A_scales,
                         const int8_t* B_packed, const __fp16* B_scales,
                         __fp16* C, size_t M, size_t K, size_t N, size_t group_size);
 
+void cactus_matmul_int4_colocated(const int8_t* A, const float* A_scales,
+                                   const uint8_t* B_colocated,
+                                   __fp16* C, size_t M, size_t K, size_t N, size_t group_size);
+
 void cactus_matmul_f16(const __fp16* a, const __fp16* b_transposed, __fp16* c,
                        size_t M, size_t K, size_t N);
 
