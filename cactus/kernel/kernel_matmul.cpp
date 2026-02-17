@@ -544,131 +544,116 @@ void cactus_gemv_int4(
     const size_t N_blocks = (N + 3) / 4;
 
 #if INT4_NEEDS_BIAS_CORRECTION
-    std::vector<int32_t> a_corrections(num_groups);
+    std::vector<float> a_corr_float(num_groups);
     for (size_t g = 0; g < num_groups; g++)
-        a_corrections[g] = sum_int8_group(A + g * group_size) * 8;
-    const int32_t* a_corr_ptr = a_corrections.data();
+        a_corr_float[g] = static_cast<float>(sum_int8_group(A + g * group_size) * 8);
+    const float* a_corr_ptr = a_corr_float.data();
 #endif
 
     auto process_blocks = [=](size_t block_start, size_t block_end) {
-        for (size_t n_block = block_start; n_block < block_end; ++n_block) {
+        size_t n_block = block_start;
+
+        for (; n_block + 1 < block_end; n_block += 2) {
+            float32x4_t sum_a = vdupq_n_f32(0.0f);
+            float32x4_t sum_b = vdupq_n_f32(0.0f);
+
+            for (size_t g = 0; g < num_groups; g++) {
+                const size_t k_base = g * group_size;
+                const int8_t* a_ptr = A + k_base;
+                const uint8_t* ba = B_packed + (n_block * K + k_base) * 2;
+                const uint8_t* bb = B_packed + ((n_block + 1) * K + k_base) * 2;
+
+                int32x4_t acc_a = vdupq_n_s32(0);
+                int32x4_t acc_b = vdupq_n_s32(0);
+
+                int8x16_t a_lo = vld1q_s8(a_ptr);
+                int8x16_t a_hi = vld1q_s8(a_ptr + 16);
+
+                {
+                    INT4_BVEC_TYPE b0, b1, b2, b3;
+                    INT4_UNPACK(ba, b1, b0);
+                    INT4_UNPACK(ba + 16, b3, b2);
+                    acc_a = INT4_DOTQ_LANE(acc_a, b0, a_lo, 0);
+                    acc_a = INT4_DOTQ_LANE(acc_a, b1, a_lo, 1);
+                    acc_a = INT4_DOTQ_LANE(acc_a, b2, a_lo, 2);
+                    acc_a = INT4_DOTQ_LANE(acc_a, b3, a_lo, 3);
+                    INT4_UNPACK(ba + 32, b1, b0);
+                    INT4_UNPACK(ba + 48, b3, b2);
+                    acc_a = INT4_DOTQ_LANE(acc_a, b0, a_hi, 0);
+                    acc_a = INT4_DOTQ_LANE(acc_a, b1, a_hi, 1);
+                    acc_a = INT4_DOTQ_LANE(acc_a, b2, a_hi, 2);
+                    acc_a = INT4_DOTQ_LANE(acc_a, b3, a_hi, 3);
+                }
+                {
+                    INT4_BVEC_TYPE b0, b1, b2, b3;
+                    INT4_UNPACK(bb, b1, b0);
+                    INT4_UNPACK(bb + 16, b3, b2);
+                    acc_b = INT4_DOTQ_LANE(acc_b, b0, a_lo, 0);
+                    acc_b = INT4_DOTQ_LANE(acc_b, b1, a_lo, 1);
+                    acc_b = INT4_DOTQ_LANE(acc_b, b2, a_lo, 2);
+                    acc_b = INT4_DOTQ_LANE(acc_b, b3, a_lo, 3);
+                    INT4_UNPACK(bb + 32, b1, b0);
+                    INT4_UNPACK(bb + 48, b3, b2);
+                    acc_b = INT4_DOTQ_LANE(acc_b, b0, a_hi, 0);
+                    acc_b = INT4_DOTQ_LANE(acc_b, b1, a_hi, 1);
+                    acc_b = INT4_DOTQ_LANE(acc_b, b2, a_hi, 2);
+                    acc_b = INT4_DOTQ_LANE(acc_b, b3, a_hi, 3);
+                }
+
+                const __fp16* spa = B_scales + (n_block * num_groups + g) * 4;
+                const __fp16* spb = B_scales + ((n_block + 1) * num_groups + g) * 4;
+                float32x4_t sa = vcvt_f32_f16(vld1_f16(spa));
+                float32x4_t sb = vcvt_f32_f16(vld1_f16(spb));
+                sum_a = vmlaq_f32(sum_a, vcvtq_f32_s32(acc_a), sa);
+                sum_b = vmlaq_f32(sum_b, vcvtq_f32_s32(acc_b), sb);
+#if INT4_NEEDS_BIAS_CORRECTION
+                float32x4_t corr = vdupq_n_f32(a_corr_ptr[g]);
+                sum_a = vmlsq_f32(sum_a, corr, sa);
+                sum_b = vmlsq_f32(sum_b, corr, sb);
+#endif
+            }
+
+            vst1_f16(C + n_block * 4, vcvt_f16_f32(vmulq_n_f32(sum_a, A_scale)));
+            vst1_f16(C + (n_block + 1) * 4, vcvt_f16_f32(vmulq_n_f32(sum_b, A_scale)));
+        }
+
+        for (; n_block < block_end; ++n_block) {
             const size_t n_start = n_block * 4;
             const size_t actual_n = std::min(size_t(4), N - n_start);
             float32x4_t running_sum = vdupq_n_f32(0.0f);
 
-            size_t g = 0;
-            for (; g + 1 < num_groups; g += 2) {
-                const size_t k_base0 = g * group_size;
-                const size_t k_base1 = (g + 1) * group_size;
-
-                const int8_t* a_ptr0 = A + k_base0;
-                const int8_t* a_ptr1 = A + k_base1;
-
-                const uint8_t* b_base0 = B_packed + (n_block * K + k_base0) * 2;
-                const uint8_t* b_base1 = B_packed + (n_block * K + k_base1) * 2;
-
-                __builtin_prefetch(b_base0 + group_size * 4, 0, 3);
-
-                int32x4_t acc0 = vdupq_n_s32(0);
-                int32x4_t acc1 = vdupq_n_s32(0);
-
-                {
-                    int8x16_t a_vec = vld1q_s8(a_ptr0);
-                    INT4_BVEC_TYPE b0, b1, b2, b3;
-                    INT4_UNPACK(b_base0, b1, b0);
-
-                    acc0 = INT4_DOTQ_LANE(acc0, b0, a_vec, 0);
-                    INT4_UNPACK(b_base0 + 16, b3, b2);
-                    acc0 = INT4_DOTQ_LANE(acc0, b1, a_vec, 1);
-                    acc0 = INT4_DOTQ_LANE(acc0, b2, a_vec, 2);
-                    acc0 = INT4_DOTQ_LANE(acc0, b3, a_vec, 3);
-
-                    a_vec = vld1q_s8(a_ptr0 + 16);
-                    INT4_UNPACK(b_base0 + 32, b1, b0);
-
-                    acc0 = INT4_DOTQ_LANE(acc0, b0, a_vec, 0);
-                    INT4_UNPACK(b_base0 + 48, b3, b2);
-                    acc0 = INT4_DOTQ_LANE(acc0, b1, a_vec, 1);
-                    acc0 = INT4_DOTQ_LANE(acc0, b2, a_vec, 2);
-                    acc0 = INT4_DOTQ_LANE(acc0, b3, a_vec, 3);
-                }
-
-                {
-                    int8x16_t a_vec = vld1q_s8(a_ptr1);
-                    INT4_BVEC_TYPE b0, b1, b2, b3;
-                    INT4_UNPACK(b_base1, b1, b0);
-
-                    acc1 = INT4_DOTQ_LANE(acc1, b0, a_vec, 0);
-                    INT4_UNPACK(b_base1 + 16, b3, b2);
-                    acc1 = INT4_DOTQ_LANE(acc1, b1, a_vec, 1);
-                    acc1 = INT4_DOTQ_LANE(acc1, b2, a_vec, 2);
-                    acc1 = INT4_DOTQ_LANE(acc1, b3, a_vec, 3);
-
-                    a_vec = vld1q_s8(a_ptr1 + 16);
-                    INT4_UNPACK(b_base1 + 32, b1, b0);
-
-                    acc1 = INT4_DOTQ_LANE(acc1, b0, a_vec, 0);
-                    INT4_UNPACK(b_base1 + 48, b3, b2);
-                    acc1 = INT4_DOTQ_LANE(acc1, b1, a_vec, 1);
-                    acc1 = INT4_DOTQ_LANE(acc1, b2, a_vec, 2);
-                    acc1 = INT4_DOTQ_LANE(acc1, b3, a_vec, 3);
-                }
-
-                const __fp16* scale_ptr0 = B_scales + (n_block * num_groups + g) * 4;
-                const __fp16* scale_ptr1 = B_scales + (n_block * num_groups + g + 1) * 4;
-
-                float16x4_t scales0_f16 = vld1_f16(scale_ptr0);
-                float16x4_t scales1_f16 = vld1_f16(scale_ptr1);
-                float32x4_t scales0 = vcvt_f32_f16(scales0_f16);
-                float32x4_t scales1 = vcvt_f32_f16(scales1_f16);
-
-#if INT4_NEEDS_BIAS_CORRECTION
-                acc0 = vsubq_s32(acc0, vdupq_n_s32(a_corr_ptr[g]));
-                acc1 = vsubq_s32(acc1, vdupq_n_s32(a_corr_ptr[g + 1]));
-#endif
-                running_sum = vmlaq_f32(running_sum, vcvtq_f32_s32(acc0), scales0);
-                running_sum = vmlaq_f32(running_sum, vcvtq_f32_s32(acc1), scales1);
-            }
-
-            for (; g < num_groups; g++) {
+            for (size_t g = 0; g < num_groups; g++) {
                 const size_t k_base = g * group_size;
                 const int8_t* a_ptr = A + k_base;
                 const uint8_t* b_base = B_packed + (n_block * K + k_base) * 2;
 
                 int32x4_t acc = vdupq_n_s32(0);
+                int8x16_t a_lo = vld1q_s8(a_ptr);
+                int8x16_t a_hi = vld1q_s8(a_ptr + 16);
 
-                int8x16_t a_vec = vld1q_s8(a_ptr);
                 INT4_BVEC_TYPE b0, b1, b2, b3;
                 INT4_UNPACK(b_base, b1, b0);
                 INT4_UNPACK(b_base + 16, b3, b2);
-
-                acc = INT4_DOTQ_LANE(acc, b0, a_vec, 0);
-                acc = INT4_DOTQ_LANE(acc, b1, a_vec, 1);
-                acc = INT4_DOTQ_LANE(acc, b2, a_vec, 2);
-                acc = INT4_DOTQ_LANE(acc, b3, a_vec, 3);
-
-                a_vec = vld1q_s8(a_ptr + 16);
+                acc = INT4_DOTQ_LANE(acc, b0, a_lo, 0);
+                acc = INT4_DOTQ_LANE(acc, b1, a_lo, 1);
+                acc = INT4_DOTQ_LANE(acc, b2, a_lo, 2);
+                acc = INT4_DOTQ_LANE(acc, b3, a_lo, 3);
                 INT4_UNPACK(b_base + 32, b1, b0);
                 INT4_UNPACK(b_base + 48, b3, b2);
+                acc = INT4_DOTQ_LANE(acc, b0, a_hi, 0);
+                acc = INT4_DOTQ_LANE(acc, b1, a_hi, 1);
+                acc = INT4_DOTQ_LANE(acc, b2, a_hi, 2);
+                acc = INT4_DOTQ_LANE(acc, b3, a_hi, 3);
 
-                acc = INT4_DOTQ_LANE(acc, b0, a_vec, 0);
-                acc = INT4_DOTQ_LANE(acc, b1, a_vec, 1);
-                acc = INT4_DOTQ_LANE(acc, b2, a_vec, 2);
-                acc = INT4_DOTQ_LANE(acc, b3, a_vec, 3);
-
-                const __fp16* scale_ptr = B_scales + (n_block * num_groups + g) * 4;
-                float16x4_t scales_f16 = vld1_f16(scale_ptr);
-                float32x4_t scales = vcvt_f32_f16(scales_f16);
-
-#if INT4_NEEDS_BIAS_CORRECTION
-                acc = vsubq_s32(acc, vdupq_n_s32(a_corr_ptr[g]));
-#endif
+                float32x4_t scales = vcvt_f32_f16(vld1_f16(B_scales + (n_block * num_groups + g) * 4));
                 running_sum = vmlaq_f32(running_sum, vcvtq_f32_s32(acc), scales);
+#if INT4_NEEDS_BIAS_CORRECTION
+                running_sum = vmlsq_f32(running_sum, vdupq_n_f32(a_corr_ptr[g]), scales);
+#endif
             }
 
             float32x4_t result = vmulq_n_f32(running_sum, A_scale);
             float16x4_t result_f16 = vcvt_f16_f32(result);
-
             if (actual_n == 4) {
                 vst1_f16(C + n_start, result_f16);
             } else {
