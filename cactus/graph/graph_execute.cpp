@@ -617,6 +617,15 @@ void CactusGraph::execute(const std::string& profile_file) {
                         for (size_t i = 0; i < elements_to_process; ++i) {
                             accumulate(static_cast<float>(typed[i]), i);
                         }
+                    } else if (buffer.precision == Precision::INT4) {
+                        const uint8_t* packed = reinterpret_cast<const uint8_t*>(data_ptr);
+                        for (size_t i = 0; i < elements_to_process; ++i) {
+                            size_t byte_idx = i / 2;
+                            int8_t val = (i % 2 == 0)
+                                ? static_cast<int8_t>((packed[byte_idx] & 0x0F) - 8)
+                                : static_cast<int8_t>(((packed[byte_idx] >> 4) & 0x0F) - 8);
+                            accumulate(static_cast<float>(val), i);
+                        }
                     } else {
                         has_data = false;
                     }
@@ -631,7 +640,7 @@ void CactusGraph::execute(const std::string& profile_file) {
                     if (bin_file.is_open()) {
                         size_t bytes_to_write = buffer.byte_size;
                         if (truncated) {
-                             bytes_to_write = PrecisionTraits::packed_size_of(buffer.precision, buffer.total_size);
+                             bytes_to_write = PrecisionTraits::packed_size_of(buffer.precision, elements_to_process);
                         }
                         bin_file.write(reinterpret_cast<const char*>(data_ptr), bytes_to_write);
                     }

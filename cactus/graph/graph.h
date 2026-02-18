@@ -620,11 +620,8 @@ namespace GraphFile {
         bool is_interleaved_ = false;
         size_t original_N_ = 0;
 
-        std::unique_ptr<int8_t[]> unpacked_data_;  
-
         void parse_header();
         void apply_madvise_hints();
-        void unpack_int4_data();
     };
 }
 

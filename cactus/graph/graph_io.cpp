@@ -1,5 +1,4 @@
 #include "graph.h"
-#include "../kernel/kernel.h"
 #include <fstream>
 #include <stdexcept>
 #include <sys/mman.h>
@@ -20,18 +19,6 @@ namespace {
         return offset + (alignment - remainder);
     }
 
-    inline void unpack_int4_to_int8(const uint8_t* packed, int8_t* unpacked, size_t packed_size) {
-        for (size_t i = 0; i < packed_size; i++) {
-            uint8_t byte = packed[i];
-
-            int8_t low = static_cast<int8_t>((byte & 0x0F) - 8);
-
-            int8_t high = static_cast<int8_t>(((byte >> 4) & 0x0F) - 8);
-
-            unpacked[i * 2] = low;
-            unpacked[i * 2 + 1] = high;
-        }
-    }
 }
 
 
@@ -301,8 +288,7 @@ MappedFile::MappedFile(MappedFile&& other) noexcept
       scales_offset_(other.scales_offset_), scales_bytes_(other.scales_bytes_),
       alignment_(other.alignment_),
       is_interleaved_(other.is_interleaved_),
-      original_N_(other.original_N_),
-      unpacked_data_(std::move(other.unpacked_data_)) {
+      original_N_(other.original_N_) {
     other.fd_ = -1;
     other.mapped_data_ = nullptr;
     other.file_size_ = 0;
@@ -333,8 +319,6 @@ MappedFile& MappedFile::operator=(MappedFile&& other) noexcept {
         alignment_ = other.alignment_;
         is_interleaved_ = other.is_interleaved_;
         original_N_ = other.original_N_;
-        unpacked_data_ = std::move(other.unpacked_data_);
-
         other.fd_ = -1;
         other.mapped_data_ = nullptr;
         other.file_size_ = 0;
@@ -361,16 +345,10 @@ const void* MappedFile::scales_data() const {
 }
 
 void* MappedFile::data() {
-    if (unpacked_data_) {
-        return unpacked_data_.get();
-    }
     return static_cast<char*>(mapped_data_) + data_offset_;
 }
 
 const void* MappedFile::data() const {
-    if (unpacked_data_) {
-        return unpacked_data_.get();
-    }
     return static_cast<const char*>(mapped_data_) + data_offset_;
 }
 
@@ -447,22 +425,6 @@ void MappedFile::parse_header() {
         throw std::runtime_error("File corrupted: data extends beyond file size");
     }
 
-    if (precision_ == Precision::INT4) {
-        unpack_int4_data();
-    }
-}
-
-void MappedFile::unpack_int4_data() {
-    size_t packed_size = byte_size_;
-    size_t unpacked_size = packed_size * 2;
-
-    unpacked_data_ = std::make_unique<int8_t[]>(unpacked_size);
-
-    const uint8_t* packed = static_cast<const uint8_t*>(mapped_data_) + data_offset_;
-    unpack_int4_to_int8(packed, unpacked_data_.get(), packed_size);
-
-    precision_ = Precision::INT8;
-    byte_size_ = unpacked_size;
 }
 
 void MappedFile::apply_madvise_hints() {

@@ -3,6 +3,7 @@
 #include <arm_neon.h>
 #include <cstring>
 #include <algorithm>
+#include <iostream>
 #include <vector>
 
 #ifdef __APPLE__
