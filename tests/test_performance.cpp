@@ -1,5 +1,3 @@
-
-
 #include "test_utils.h"
 #include <chrono>
 #include <vector>
@@ -11,7 +9,6 @@
 #include <random>
 #include <filesystem>
 #include <fstream>
-#include "../cactus/ffi/cactus_ffi.h"
 
 struct BenchmarkConfig {
     std::vector<size_t> dimensions = {1024};
@@ -301,7 +298,7 @@ void benchmark_matmul_ops(TestUtils::TestRunner& runner, const BenchmarkConfig& 
 }
 
 void benchmark_matmul_int8_grouped(TestUtils::TestRunner& runner, const BenchmarkConfig& config) {
-    const size_t group_size = 64;
+    const size_t group_size = 64; 
 
     std::vector<std::tuple<size_t, size_t, size_t>> shapes = {
         {1, 1024, 1024},
@@ -353,222 +350,6 @@ void benchmark_matmul_int8_grouped(TestUtils::TestRunner& runner, const Benchmar
             "MatMul INT8 " + std::to_string(M) + "x" + std::to_string(K_aligned) + "x" + std::to_string(N),
             details.str());
     }
-}
-
-
-// Real-world Gemma model benchmark comparing INT4 vs INT8 inference
-void benchmark_gemma_int4_vs_int8_inference(TestUtils::TestRunner& runner, const BenchmarkConfig& config,
-                                            const char* model_path) {
-    runner.log_performance("GEMMA MODEL INFERENCE BENCHMARK", "");
-    // Test prompts of varying lengths
-    std::vector<std::pair<std::string, std::string>> test_prompts = {
-        {"Short Prompt", R"([{"role": "user", "content": "Hello, how are you?"}])"},
-        {"Medium Prompt", R"([{"role": "user", "content": "Explain the concept of machine learning in a few sentences."}])"},
-        {"Long Prompt", R"([{"role": "user", "content": "Write a detailed explanation of how transformer neural networks work, including attention mechanisms, positional encoding, and the training process."}])"},
-    };
-
-    const char* options_json = R"({"max_tokens": 50, "temperature": 0.0})";  
-
-    auto get_json_double = [](const std::string& json, const std::string& key) -> double {
-        size_t pos = json.find("\"" + key + "\":");
-        if (pos == std::string::npos) return 0.0;
-        pos += key.length() + 3;
-        size_t end = json.find_first_of(",}", pos);
-        return std::stod(json.substr(pos, end - pos));
-    };
-
-    for (const auto& [prompt_name, messages_json] : test_prompts) {
-        runner.log_performance("", "");
-        runner.log_performance("Testing: " + prompt_name, "");
-
-        double total_time_int4 = 0.0, total_time_int8 = 0.0;
-        double total_tps_int4 = 0.0, total_tps_int8 = 0.0;
-        double total_tokens_int4 = 0.0, total_tokens_int8 = 0.0;
-        int successful_runs = 0;
-        const int num_runs = std::max(1, config.iterations);
-
-        for (int run = 0; run < num_runs; ++run) {
-            bool int4_success = false;
-            bool int8_success = false;
-
-            // Test INT4 mode
-            {
-                TensorConfig::global().enable_int4_packing = true;
-
-                cactus_model_t model = cactus_init(model_path, nullptr, false);
-                if (!model) {
-                    runner.log_performance("INT4 Run " + std::to_string(run), "FAILED: Model init failed");
-                    continue;
-                }
-
-                char response_buffer[4096];
-                memset(response_buffer, 0, sizeof(response_buffer));
-
-                auto start_time = std::chrono::high_resolution_clock::now();
-                int result = cactus_complete(model, messages_json.c_str(), response_buffer,
-                                           sizeof(response_buffer), options_json, nullptr, nullptr, nullptr);
-                auto end_time = std::chrono::high_resolution_clock::now();
-                double elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-
-                cactus_destroy(model);
-
-                if (result > 0 && strlen(response_buffer) > 0) {
-                    std::string response_json(response_buffer);
-                    double tps = get_json_double(response_json, "decode_tps");
-                    double tokens = get_json_double(response_json, "completion_tokens");
-
-                    total_tps_int4 += tps;
-                    total_tokens_int4 += tokens;
-                    total_time_int4 += elapsed_ms;
-                    int4_success = true;
-                } else {
-                    runner.log_performance("INT4 Run " + std::to_string(run),
-                                         "FAILED: result=" + std::to_string(result) +
-                                         ", response_len=" + std::to_string(strlen(response_buffer)));
-                }
-
-            }
-
-            // Test INT8 mode
-            {
-                TensorConfig::global().enable_int4_packing = false;
-
-                cactus_model_t model = cactus_init(model_path, nullptr, false);
-                if (!model) {
-                    runner.log_performance("INT8 Run " + std::to_string(run), "FAILED: Model init failed");
-                    continue;
-                }
-
-                char response_buffer[4096];
-                memset(response_buffer, 0, sizeof(response_buffer));
-
-                auto start_time = std::chrono::high_resolution_clock::now();
-                int result = cactus_complete(model, messages_json.c_str(), response_buffer,
-                                           sizeof(response_buffer), options_json, nullptr, nullptr, nullptr);
-                auto end_time = std::chrono::high_resolution_clock::now();
-                double elapsed_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-
-                cactus_destroy(model);
-
-                if (result > 0 && strlen(response_buffer) > 0) {
-                    std::string response_json(response_buffer);
-                    double tps = get_json_double(response_json, "decode_tps");
-                    double tokens = get_json_double(response_json, "completion_tokens");
-
-                    total_tps_int8 += tps;
-                    total_tokens_int8 += tokens;
-                    total_time_int8 += elapsed_ms;
-                    int8_success = true;
-                } else {
-                    runner.log_performance("INT8 Run " + std::to_string(run),
-                                         "FAILED: result=" + std::to_string(result) +
-                                         ", response_len=" + std::to_string(strlen(response_buffer)));
-                }
-            }
-
-            // Only count as successful run if both INT4 and INT8 succeeded
-            if (int4_success && int8_success) {
-                successful_runs++;
-            }
-        }
-
-        // Reset to default INT4 mode
-        TensorConfig::global().enable_int4_packing = true;
-
-        if (successful_runs > 0) {
-            double avg_time_int4 = total_time_int4 / successful_runs;
-            double avg_time_int8 = total_time_int8 / successful_runs;
-            double speedup = avg_time_int8 / avg_time_int4;
-
-            // Estimate tokens per second (rough approximation)
-            double tps_int4 = total_tps_int4 / successful_runs;
-            double tps_int8 = total_tps_int8 / successful_runs;
-
-            std::ostringstream details;
-            details << std::fixed << std::setprecision(3)
-                    << "INT4: " << avg_time_int4 << "ms (" << std::setprecision(1) << tps_int4 << " tok/s)"
-                    << " | INT8: " << std::setprecision(3) << avg_time_int8 << "ms (" << std::setprecision(1) << tps_int8 << " tok/s)"
-                    << " | Speedup: " << std::setprecision(2) << speedup << "x"
-                    << " | Runs: " << successful_runs;
-
-            runner.log_performance(prompt_name + " Inference", details.str());
-        } else {
-            runner.log_performance(prompt_name + " Inference", "FAILED: No successful runs");
-        }
-    }
-
-    runner.log_performance("", "");
-}
-
-// Model loading benchmark comparing INT4 vs INT8 load times
-void benchmark_gemma_model_loading(TestUtils::TestRunner& runner, const BenchmarkConfig& config,
-                                   const char* model_path) {
-
-    runner.log_performance("MODEL LOADING BENCHMARK", "");
-
-    const int num_runs = std::max(1, config.iterations);
-    double total_load_time_int4 = 0.0, total_load_time_int8 = 0.0;
-    int successful_loads = 0;
-
-    for (int run = 0; run < num_runs; ++run) {
-        // Test INT4 loading
-        {
-            TensorConfig::global().enable_int4_packing = true;
-
-            auto start_time = std::chrono::high_resolution_clock::now();
-            cactus_model_t model = cactus_init(model_path, nullptr, false);
-            auto end_time = std::chrono::high_resolution_clock::now();
-
-            if (model) {
-                double load_time = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-                total_load_time_int4 += load_time;
-                cactus_destroy(model);
-            } else {
-                runner.log_performance("INT4 Load Run " + std::to_string(run), "FAILED");
-                continue;
-            }
-        }
-
-        // Test INT8 loading
-        {
-            TensorConfig::global().enable_int4_packing = false;
-
-            auto start_time = std::chrono::high_resolution_clock::now();
-            cactus_model_t model = cactus_init(model_path, nullptr, false);
-            auto end_time = std::chrono::high_resolution_clock::now();
-
-            if (model) {
-                double load_time = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-                total_load_time_int8 += load_time;
-                successful_loads++;
-                cactus_destroy(model);
-            } else {
-                runner.log_performance("INT8 Load Run " + std::to_string(run), "FAILED");
-            }
-        }
-    }
-
-    // Reset to default
-    TensorConfig::global().enable_int4_packing = true;
-
-    if (successful_loads > 0) {
-        double avg_load_int4 = total_load_time_int4 / successful_loads;
-        double avg_load_int8 = total_load_time_int8 / successful_loads;
-        double speedup = avg_load_int8 / avg_load_int4;
-
-        std::ostringstream details;
-        details << std::fixed << std::setprecision(3)
-                << "INT4: " << avg_load_int4 << "ms"
-                << " | INT8: " << avg_load_int8 << "ms"
-                << " | Speedup: " << std::setprecision(2) << speedup << "x"
-                << " | Runs: " << successful_loads;
-
-        runner.log_performance("Model Loading Time", details.str());
-    } else {
-        runner.log_performance("Model Loading Time", "FAILED: No successful loads");
-    }
-
-    runner.log_performance("", "");
 }
 
 template<typename T>
@@ -1161,21 +942,6 @@ bool test_grouped_int8_matmul_performance(TestUtils::TestRunner& runner) {
     return true;
 }
 
-
-bool test_gemma_int4_vs_int8_inference_performance(TestUtils::TestRunner& runner) {
-    BenchmarkConfig config;
-    const char* model_path = "/Users/jisharajala/cactus/weights/gemma-3-270m-it";
-    benchmark_gemma_int4_vs_int8_inference(runner, config, model_path);
-    return true;
-}
-
-bool test_gemma_model_loading_performance(TestUtils::TestRunner& runner) {
-    BenchmarkConfig config;
-    const char* model_path = "/Users/jisharajala/cactus/weights/gemma-3-270m-it";
-    benchmark_gemma_model_loading(runner, config, model_path);
-    return true;
-}
-
 bool test_unary_operations_performance(TestUtils::TestRunner& runner) {
     BenchmarkConfig config;
     benchmark_unary_ops<__fp16>(runner, config);
@@ -1231,8 +997,6 @@ int main() {
     runner.run_test("Matrix Multiplication", test_matrix_multiplication_performance(runner));
     runner.run_test("F16 MatMul", test_gemm_f16_direct_performance(runner));
     runner.run_test("Grouped INT8 MatMul", test_grouped_int8_matmul_performance(runner));
-    runner.run_test("Gemma INT4 vs INT8 Inference", test_gemma_int4_vs_int8_inference_performance(runner));
-    runner.run_test("Gemma Model Loading", test_gemma_model_loading_performance(runner));
     runner.run_test("Unary Operations", test_unary_operations_performance(runner));
     runner.run_test("Reduction Operations", test_reduction_operations_performance(runner));
     runner.run_test("Advanced Operations", test_advanced_operations_performance(runner));

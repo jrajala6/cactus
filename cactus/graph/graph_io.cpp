@@ -185,8 +185,7 @@ void save_node(CactusGraph& graph, size_t node_id, const std::string& filename) 
         total_elements *= dim;
     }
 
-    size_t element_size = PrecisionTraits::size_of(precision);
-    size_t byte_size = total_elements * element_size;
+    size_t byte_size = PrecisionTraits::packed_size_of(precision, total_elements);
 
     bool has_scales = (precision == Precision::INT8 && buffer.is_grouped_int8() && buffer.scales_data);
     size_t N = shape.size() >= 1 ? shape[0] : 1;
@@ -448,7 +447,7 @@ void MappedFile::parse_header() {
         throw std::runtime_error("File corrupted: data extends beyond file size");
     }
 
-    if (precision_ == Precision::INT4 && !TensorConfig::global().enable_int4_packing) {
+    if (precision_ == Precision::INT4) {
         unpack_int4_data();
     }
 }

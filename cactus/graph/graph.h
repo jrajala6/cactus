@@ -191,7 +191,6 @@ struct TensorConfig {
     Precision compute_precision = Precision::INT8;
     Precision output_precision = Precision::INT8;
     bool auto_mixed_precision = false;
-    bool enable_int4_packing = true;
     
     static TensorConfig& global();
 };

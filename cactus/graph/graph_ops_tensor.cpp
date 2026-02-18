@@ -33,7 +33,7 @@ void compute_gather_node(GraphNode& node, const std::vector<std::unique_ptr<Grap
     }
 
     size_t num_indices = indices_buffer.total_size;
-    size_t bytes_per_element = element_size * PrecisionTraits::size_of(tensor_buffer.precision);
+    size_t bytes_per_element = PrecisionTraits::packed_size_of(tensor_buffer.precision, element_size);
 
     if (tensor_buffer.precision == Precision::INT8) {
         const int8_t* tensor_data = tensor_buffer.data_as<int8_t>();
