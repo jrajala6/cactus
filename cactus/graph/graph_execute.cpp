@@ -1,5 +1,6 @@
 #include "graph.h"
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -435,6 +436,24 @@ void CactusGraph::execute(const std::string& profile_file) {
                             if (i > 0) weights_str += ",";
                             weights_str += std::to_string(static_cast<int>(int8_data[i]));
                         }
+                    } else if (weight_node->output_buffer.precision == Precision::INT4) {
+                        const uint8_t* packed = weight_node->output_buffer.data_as<uint8_t>();
+                        uint8x16_t packed_vec = vld1q_u8(packed);
+                        int8x16_t low = vreinterpretq_s8_u8(vandq_u8(packed_vec, vdupq_n_u8(0x0F)));
+                        int8x16_t high = vreinterpretq_s8_u8(vshrq_n_u8(packed_vec, 4));
+                        int8x16_t bias = vdupq_n_s8(8);
+                        low = vsubq_s8(low, bias);
+                        high = vsubq_s8(high, bias);
+
+                        int8_t low_lanes[16], high_lanes[16];
+                        vst1q_s8(low_lanes, low);
+                        vst1q_s8(high_lanes, high);
+
+                        for (size_t i = 0; i < num_values; ++i) {
+                            if (i > 0) weights_str += ",";
+                            int8_t val = (i < 16) ? low_lanes[i] : high_lanes[i - 16];
+                            weights_str += std::to_string(static_cast<int>(val));
+                        }
                     }
 
                     if (weight_node->output_buffer.total_size > 5) {
@@ -618,13 +637,27 @@ void CactusGraph::execute(const std::string& profile_file) {
                             accumulate(static_cast<float>(typed[i]), i);
                         }
                     } else if (buffer.precision == Precision::INT4) {
-                        const uint8_t* packed = reinterpret_cast<const uint8_t*>(data_ptr);
-                        for (size_t i = 0; i < elements_to_process; ++i) {
-                            size_t byte_idx = i / 2;
-                            int8_t val = (i % 2 == 0)
-                                ? static_cast<int8_t>((packed[byte_idx] & 0x0F) - 8)
-                                : static_cast<int8_t>(((packed[byte_idx] >> 4) & 0x0F) - 8);
-                            accumulate(static_cast<float>(val), i);
+                        assert(elements_to_process % 32 == 0 && "INT4 precision capture requires element count to be multiple of 32");
+                        const uint8_t* packed_ptr = reinterpret_cast<const uint8_t*>(data_ptr);
+                        for (size_t i = 0; i < elements_to_process; i+=32) {
+                            uint8x16_t packed_vec = vld1q_u8(packed_ptr + i / 2);
+                            int8x16_t high = vreinterpretq_s8_u8(vshrq_n_u8(packed_vec, 4));
+                            int8x16_t low = vreinterpretq_s8_u8(vandq_u8(packed_vec, vdupq_n_u8(0x0F)));
+
+                            int8x16_t bias = vdupq_n_s8(8);
+                            high = vsubq_s8(high, bias);
+                            low = vsubq_s8(low, bias);
+
+                            int8_t high_lanes[16], low_lanes[16];
+                            vst1q_s8(high_lanes, high);
+                            vst1q_s8(low_lanes, low);
+
+                            for (size_t j = 0; j < 16; ++j) {
+                                accumulate(static_cast<float>(low_lanes[j]), i + j);
+                            }
+                            for (size_t j = 0; j < 16; ++j) {
+                                accumulate(static_cast<float>(high_lanes[j]), i + 16 + j);
+                            }
                         }
                     } else {
                         has_data = false;

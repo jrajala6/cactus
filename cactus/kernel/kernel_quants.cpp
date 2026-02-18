@@ -294,7 +294,7 @@ void cactus_quantize_kv_fp16_to_int8(
 }
 
 void cactus_unpack_int4_to_int8(const uint8_t* packed, int8_t* unpacked, size_t unpacked_count) {
-    assert (unpacked_count % 32 == 0  && "Unpacked count must be a multiple of 32 for int4 unpacking");
+    assert (unpacked_count % 32 == 0 && "Unpacked count must be a multiple of 32 for int4 unpacking");
     const size_t num_groups = unpacked_count / 32;
 
     CactusThreading::parallel_for(num_groups, CactusThreading::Thresholds::ELEMENT_WISE,
