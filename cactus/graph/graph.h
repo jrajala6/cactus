@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <functional>
+#include <cassert>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -151,8 +152,17 @@ struct PrecisionTraits {
 
     static constexpr size_t packed_size_of(Precision prec, size_t count) {
         switch (prec) {
-            case Precision::INT4: return (count + 1) / 2;  
+            case Precision::INT4: return (count + 1) / 2;
             default: return count * size_of(prec);
+        }
+    }
+
+    static size_t byte_offset_of(Precision prec, size_t element_offset) {
+        switch (prec) {
+            case Precision::INT4:
+                assert(element_offset % 32 == 0 && "INT4 byte offset must be group-aligned (multiple of 32)");
+                return element_offset / 2;
+            default: return element_offset * size_of(prec);
         }
     }
 
