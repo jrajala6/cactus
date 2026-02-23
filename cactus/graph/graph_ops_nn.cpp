@@ -155,7 +155,7 @@ void compute_matmul_node(GraphNode& node, const std::vector<std::unique_ptr<Grap
     const bool lhs_is_prequantized_int8 = (lhs_buffer.precision == Precision::INT8 &&
                                             lhs_buffer.has_activation_scales());
 
-    if (rhs_buffer.is_grouped_int8() || rhs_buffer.is_grouped_int4()) {
+    if (PrecisionTraits::is_integer(rhs_buffer.precision) && rhs_buffer.group_size > 0) {
         const int8_t* rhs = rhs_buffer.data_as<int8_t>();
         const __fp16* rhs_scales = rhs_buffer.scales_as_fp16();
         __fp16* output = node.output_buffer.data_as<__fp16>();
@@ -181,16 +181,10 @@ void compute_matmul_node(GraphNode& node, const std::vector<std::unique_ptr<Grap
             throw std::runtime_error("Quantized matmul requires INT8 (pre-quantized) or FP16 activations");
         }
 
-        if (rhs_buffer.is_grouped_int4()) {
-            cactus_matmul_int4(lhs_int8, lhs_scales,
-                               rhs, rhs_scales, output,
-                               M, K, N, rhs_buffer.group_size);
-        } else {
-            cactus_matmul_int8(lhs_int8, lhs_scales,
-                               rhs, rhs_scales, output,
-                               M, K, N, rhs_buffer.group_size);
-        }
-
+        cactus_matmul_integer(rhs_buffer.precision,
+                        lhs_int8, lhs_scales,
+                        rhs, rhs_scales, output,
+                        M, K, N, rhs_buffer.group_size);
     } else {
         if (lhs_buffer.precision != Precision::FP16) {
             throw std::runtime_error("FP16 matmul requires FP16 activations");
@@ -254,7 +248,6 @@ namespace {
             return;
         }
 
-        // if (rhs_buffer.precision == Precision::INT8 && rhs_buffer.is_grouped_int8()) {
         if (PrecisionTraits::is_integer(rhs_buffer.precision) && rhs_buffer.group_size > 0) {
             int8_t* lhs_q = moe_lhs_q_buf.data();
             float* lhs_scales = moe_lhs_scales_buf.data();
@@ -266,17 +259,11 @@ namespace {
                     cactus_fp16_to_int8(lhs + row * K, lhs_q + row * K, K, scale);
                 }
             }
-            if (rhs_buffer.precision == Precision::INT4) {
-                cactus_matmul_int4(lhs_q, lhs_scales,
-                                   rhs_buffer.data_as<int8_t>(),
-                                   rhs_buffer.scales_as_fp16(),
-                                   output, M, K, N, rhs_buffer.group_size);
-                return;
-            }
-            cactus_matmul_int8(lhs_q, lhs_scales,
-                               rhs_buffer.data_as<int8_t>(),
-                               rhs_buffer.scales_as_fp16(),
-                               output, M, K, N, rhs_buffer.group_size);
+            cactus_matmul_integer(rhs_buffer.precision,
+                           lhs_q, lhs_scales,
+                           rhs_buffer.data_as<int8_t>(),
+                           rhs_buffer.scales_as_fp16(),
+                           output, M, K, N, rhs_buffer.group_size);
             return;
         }
 

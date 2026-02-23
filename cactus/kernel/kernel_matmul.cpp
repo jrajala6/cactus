@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "kernel_utils.h"
+#include "../graph/graph.h"
 #include <arm_neon.h>
 #include <cstring>
 #include <algorithm>
@@ -781,5 +782,16 @@ void cactus_matmul_int4(const int8_t* A, const float* A_scales,
         cactus_gemv_int4(A, A_scales[0], B_packed, B_scales, C, K, N, group_size);
     } else {
         cactus_gemm_int4(A, A_scales, B_packed, B_scales, C, M, K, N, group_size);
+    }
+}
+
+void cactus_matmul_integer(Precision precision,
+                            const int8_t* A, const float* A_scales,
+                            const int8_t* B, const __fp16* B_scales,
+                            __fp16* C, size_t M, size_t K, size_t N, size_t group_size) {
+    if (precision == Precision::INT4) {
+        cactus_matmul_int4(A, A_scales, B, B_scales, C, M, K, N, group_size);
+    } else {
+        cactus_matmul_int8(A, A_scales, B, B_scales, C, M, K, N, group_size);
     }
 }

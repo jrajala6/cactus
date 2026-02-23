@@ -372,7 +372,6 @@ struct KVCache {
                          size_t num_tokens, size_t kv_heads, size_t head_dim);
 
     bool is_empty() const { return current_seq_len == 0; }
-    bool is_int8() const { return precision == Precision::INT8; }
     void* get_key_ptr(size_t layer);
     void* get_value_ptr(size_t layer);
 

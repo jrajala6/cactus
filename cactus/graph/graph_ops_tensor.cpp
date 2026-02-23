@@ -53,36 +53,18 @@ void compute_gather_node(GraphNode& node, const std::vector<std::unique_ptr<Grap
             gathered_scales = reinterpret_cast<__fp16*>(node.output_buffer.owned_scales.get());
         }
 
-        if (indices_buffer.precision == Precision::INT8) {
-            const int8_t* indices = indices_buffer.data_as<int8_t>();
-            for (size_t i = 0; i < num_indices; i++) {
-                size_t idx = static_cast<size_t>(indices[i]);
-                if (idx >= first_dim) {
-                    throw std::runtime_error("Gather index " + std::to_string(idx) + " out of bounds for dimension " + std::to_string(first_dim));
-                }
-                std::memcpy(output + PrecisionTraits::byte_offset_of(prec, i * element_size),
-                            tensor_data + PrecisionTraits::byte_offset_of(prec, idx * element_size),
-                            bytes_per_element);
-                if (is_grouped) {
-                    for (size_t g = 0; g < num_groups; g++) {
-                        gathered_scales[i * num_groups + g] = src_scales[idx * num_groups + g];
-                    }
-                }
+        const int8_t* indices = indices_buffer.data_as<int8_t>();
+        for (size_t i = 0; i < num_indices; i++) {
+            size_t idx = static_cast<size_t>(indices[i]);
+            if (idx >= first_dim) {
+                throw std::runtime_error("Gather index " + std::to_string(idx) + " out of bounds for dimension " + std::to_string(first_dim));
             }
-        } else {
-            const float* indices = indices_buffer.data_as<float>();
-            for (size_t i = 0; i < num_indices; i++) {
-                size_t idx = static_cast<size_t>(indices[i]);
-                if (idx >= first_dim) {
-                    throw std::runtime_error("Gather index " + std::to_string(idx) + " out of bounds for dimension " + std::to_string(first_dim));
-                }
-                std::memcpy(output + PrecisionTraits::byte_offset_of(prec, i * element_size),
-                            tensor_data + PrecisionTraits::byte_offset_of(prec, idx * element_size),
-                            bytes_per_element);
-                if (is_grouped) {
-                    for (size_t g = 0; g < num_groups; g++) {
-                        gathered_scales[i * num_groups + g] = src_scales[idx * num_groups + g];
-                    }
+            std::memcpy(output + PrecisionTraits::byte_offset_of(prec, i * element_size),
+                        tensor_data + PrecisionTraits::byte_offset_of(prec, idx * element_size),
+                        bytes_per_element);
+            if (is_grouped) {
+                for (size_t g = 0; g < num_groups; g++) {
+                    gathered_scales[i * num_groups + g] = src_scales[idx * num_groups + g];
                 }
             }
         }
