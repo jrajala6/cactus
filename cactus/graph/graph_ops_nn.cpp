@@ -254,7 +254,8 @@ namespace {
             return;
         }
 
-        if (rhs_buffer.precision == Precision::INT8 && rhs_buffer.is_grouped_int8()) {
+        // if (rhs_buffer.precision == Precision::INT8 && rhs_buffer.is_grouped_int8()) {
+        if (PrecisionTraits::is_integer(rhs_buffer.precision) && rhs_buffer.group_size > 0) {
             int8_t* lhs_q = moe_lhs_q_buf.data();
             float* lhs_scales = moe_lhs_scales_buf.data();
             if (!lhs_prequantized) {
@@ -265,6 +266,13 @@ namespace {
                     cactus_fp16_to_int8(lhs + row * K, lhs_q + row * K, K, scale);
                 }
             }
+            if (rhs_buffer.precision == Precision::INT4) {
+                cactus_matmul_int4(lhs_q, lhs_scales,
+                                   rhs_buffer.data_as<int8_t>(),
+                                   rhs_buffer.scales_as_fp16(),
+                                   output, M, K, N, rhs_buffer.group_size);
+                return;
+            }
             cactus_matmul_int8(lhs_q, lhs_scales,
                                rhs_buffer.data_as<int8_t>(),
                                rhs_buffer.scales_as_fp16(),
@@ -272,7 +280,7 @@ namespace {
             return;
         }
 
-        throw std::runtime_error("moe_layer only supports FP16 or grouped INT8 expert weights");
+        throw std::runtime_error("moe_layer only supports FP16 or grouped INT4/INT8 expert weights");
     }
 }
 
