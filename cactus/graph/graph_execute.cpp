@@ -1,4 +1,5 @@
 #include "graph.h"
+#include "../kernel/kernel_utils.h"
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -438,13 +439,8 @@ void CactusGraph::execute(const std::string& profile_file) {
                         }
                     } else if (weight_node->output_buffer.precision == Precision::INT4) {
                         const uint8_t* packed = weight_node->output_buffer.data_as<uint8_t>();
-                        uint8x16_t packed_vec = vld1q_u8(packed);
-                        int8x16_t low = vreinterpretq_s8_u8(vandq_u8(packed_vec, vdupq_n_u8(0x0F)));
-                        int8x16_t high = vreinterpretq_s8_u8(vshrq_n_u8(packed_vec, 4));
-                        int8x16_t bias = vdupq_n_s8(8);
-                        low = vsubq_s8(low, bias);
-                        high = vsubq_s8(high, bias);
-
+                        int8x16_t high, low;
+                        unpack_int4_as_int8x16x2(packed, high, low);
                         int8_t low_lanes[16], high_lanes[16];
                         vst1q_s8(low_lanes, low);
                         vst1q_s8(high_lanes, high);
@@ -640,14 +636,8 @@ void CactusGraph::execute(const std::string& profile_file) {
                         assert(elements_to_process % 32 == 0 && "INT4 precision capture requires element count to be multiple of 32");
                         const uint8_t* packed_ptr = reinterpret_cast<const uint8_t*>(data_ptr);
                         for (size_t i = 0; i < elements_to_process; i+=32) {
-                            uint8x16_t packed_vec = vld1q_u8(packed_ptr + i / 2);
-                            int8x16_t high = vreinterpretq_s8_u8(vshrq_n_u8(packed_vec, 4));
-                            int8x16_t low = vreinterpretq_s8_u8(vandq_u8(packed_vec, vdupq_n_u8(0x0F)));
-
-                            int8x16_t bias = vdupq_n_s8(8);
-                            high = vsubq_s8(high, bias);
-                            low = vsubq_s8(low, bias);
-
+                            int8x16_t high, low;
+                            unpack_int4_as_int8x16x2(packed_ptr + i / 2, high, low);
                             int8_t high_lanes[16], low_lanes[16];
                             vst1q_s8(high_lanes, high);
                             vst1q_s8(low_lanes, low);

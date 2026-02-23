@@ -303,14 +303,8 @@ void cactus_unpack_int4_to_int8(const uint8_t* packed, int8_t* unpacked, size_t 
                 const uint8_t* src = &packed[group * 16];
                 int8_t* dst = &unpacked[group * 32];
 
-                uint8x16_t input = vld1q_u8(src);
-                uint8x16_t low_nibbles = vandq_u8(input, vdupq_n_u8(0x0F));
-                uint8x16_t high_nibbles = vshrq_n_u8(input, 4);
-                const uint8x16_t offset = vdupq_n_u8(8);
-
-                int8x16_t low_signed = vreinterpretq_s8_u8(vsubq_u8(low_nibbles, offset));
-                int8x16_t high_signed = vreinterpretq_s8_u8(vsubq_u8(high_nibbles, offset));
-                
+                int8x16_t high_signed, low_signed;
+                unpack_int4_as_int8x16x2(src, high_signed, low_signed);
                 vst1q_s8(dst, low_signed);
                 vst1q_s8(dst + 16, high_signed);
             }
