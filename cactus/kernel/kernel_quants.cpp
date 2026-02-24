@@ -228,20 +228,28 @@ float cactus_fp16_max_abs(const __fp16* src, size_t count) {
 }
 
 static inline float quantize_group_fp16_to_int8(const __fp16* src, int8_t* dst, size_t count) {
+    constexpr size_t MAX_GROUP = 128;
+    float cache_fp32[MAX_GROUP];
 
     float32x4_t max_vec = vdupq_n_f32(0.0f);
     size_t k = 0;
 
     for (; k + 8 <= count; k += 8) {
         float16x8_t vals = vld1q_f16(src + k);
-        max_vec = vmaxq_f32(max_vec, vabsq_f32(vcvt_f32_f16(vget_low_f16(vals))));
-        max_vec = vmaxq_f32(max_vec, vabsq_f32(vcvt_f32_f16(vget_high_f16(vals))));
+        float32x4_t lo = vcvt_f32_f16(vget_low_f16(vals));
+        float32x4_t hi = vcvt_f32_f16(vget_high_f16(vals));
+        vst1q_f32(cache_fp32 + k, lo);
+        vst1q_f32(cache_fp32 + k + 4, hi);
+        max_vec = vmaxq_f32(max_vec, vabsq_f32(lo));
+        max_vec = vmaxq_f32(max_vec, vabsq_f32(hi));
     }
 
     float max_abs = vmaxvq_f32(max_vec);
     for (; k < count; k++) {
-        float val = std::abs(static_cast<float>(src[k]));
-        if (val > max_abs) max_abs = val;
+        float val = static_cast<float>(src[k]);
+        cache_fp32[k] = val;
+        float abs_val = std::abs(val);
+        if (abs_val > max_abs) max_abs = abs_val;
     }
 
     float scale = max_abs / 127.0f;
@@ -251,9 +259,10 @@ static inline float quantize_group_fp16_to_int8(const __fp16* src, int8_t* dst, 
 
     k = 0;
     for (; k + 8 <= count; k += 8) {
-        float16x8_t vals = vld1q_f16(src + k);
-        int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(vcvt_f32_f16(vget_low_f16(vals)), inv_scale_vec));
-        int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(vcvt_f32_f16(vget_high_f16(vals)), inv_scale_vec));
+        float32x4_t lo = vld1q_f32(cache_fp32 + k);
+        float32x4_t hi = vld1q_f32(cache_fp32 + k + 4);
+        int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(lo, inv_scale_vec));
+        int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(hi, inv_scale_vec));
         int16x4_t s0 = vqmovn_s32(i0);
         int16x4_t s1 = vqmovn_s32(i1);
         int8x8_t result = vqmovn_s16(vcombine_s16(s0, s1));
@@ -261,7 +270,7 @@ static inline float quantize_group_fp16_to_int8(const __fp16* src, int8_t* dst, 
     }
 
     for (; k < count; k++) {
-        float val = static_cast<float>(src[k]) * inv_scale;
+        float val = cache_fp32[k] * inv_scale;
         int32_t q = static_cast<int32_t>(roundf(val));
         q = std::max(-128, std::min(127, q));
         dst[k] = static_cast<int8_t>(q);
