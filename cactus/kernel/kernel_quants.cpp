@@ -195,30 +195,36 @@ void cactus_fp16_to_int8(const __fp16* src, int8_t* dst, size_t count, float sca
 }
 
 float cactus_fp16_max_abs(const __fp16* src, size_t count) {
-    float32x4_t abs_max_vec = vdupq_n_f32(0.0f);
-    const size_t simd_end = (count / 8) * 8;
+    return CactusThreading::parallel_reduce(count, CactusThreading::Thresholds::ALL_REDUCE,
+        [src](size_t start, size_t end) -> float {
+            float32x4_t abs_max_vec = vdupq_n_f32(0.0f);
+            const size_t simd_end = start + ((end - start) / 8) * 8;
 
-    for (size_t i = 0; i < simd_end; i += 8) {
-        float16x8_t input = vld1q_f16(&src[i]);
+            for (size_t i = start; i < simd_end; i += 8) {
+                float16x8_t input = vld1q_f16(&src[i]);
 
-        float32x4_t input_low = vcvt_f32_f16(vget_low_f16(input));
-        float32x4_t input_high = vcvt_f32_f16(vget_high_f16(input));
+                float32x4_t input_low = vcvt_f32_f16(vget_low_f16(input));
+                float32x4_t input_high = vcvt_f32_f16(vget_high_f16(input));
 
-        float32x4_t abs_low = vabsq_f32(input_low);
-        float32x4_t abs_high = vabsq_f32(input_high);
+                float32x4_t abs_low = vabsq_f32(input_low);
+                float32x4_t abs_high = vabsq_f32(input_high);
 
-        abs_max_vec = vmaxq_f32(abs_max_vec, abs_low);
-        abs_max_vec = vmaxq_f32(abs_max_vec, abs_high);
-    }
+                abs_max_vec = vmaxq_f32(abs_max_vec, abs_low);
+                abs_max_vec = vmaxq_f32(abs_max_vec, abs_high);
+            }
 
-    float max_abs = vmaxvq_f32(abs_max_vec);
+            float max_abs = vmaxvq_f32(abs_max_vec);
 
-    for (size_t i = simd_end; i < count; ++i) {
-        float abs_val = std::abs(static_cast<float>(src[i]));
-        max_abs = std::max(max_abs, abs_val);
-    }
+            for (size_t i = simd_end; i < end; ++i) {
+                float abs_val = std::abs(static_cast<float>(src[i]));
+                max_abs = std::max(max_abs, abs_val);
+            }
 
-    return max_abs;
+            return max_abs;
+        },
+        0.0f,
+        [](float a, float b) -> float { return std::max(a, b); }
+    );
 }
 
 static inline float quantize_group_fp16_to_int8(const __fp16* src, int8_t* dst, size_t count) {
