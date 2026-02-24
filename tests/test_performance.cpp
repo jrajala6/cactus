@@ -1017,6 +1017,62 @@ bool test_stft_performance(TestUtils::TestRunner& runner) {
     return true;
 }
 
+void benchmark_quantization_scaling(TestUtils::TestRunner& runner, const BenchmarkConfig& config) {
+    // Test sizes from 1M to 16M elements
+    const std::vector<size_t> sizes = {1024*1024, 4*1024*1024, 16*1024*1024};
+    
+    for (size_t count : sizes) {
+        std::vector<__fp16> src(count);
+        setup_random_data<__fp16>(src);
+        
+        // 1. max_abs Scaling
+        double ms = time_operation<__fp16>([&]() {
+            cactus_fp16_max_abs(src.data(), count);
+        }, config.iterations);
+        
+        double gbps = (count * sizeof(__fp16)) / (ms * 1e6);
+        std::ostringstream details;
+        details << std::fixed << std::setprecision(3) << ms << "ms, "
+                << std::setprecision(2) << gbps << " GB/s";
+        runner.log_performance("MaxAbs Scaling [" + std::to_string(count/1024/1024) + "M]", 
+            details.str());
+    }
+
+    // KV Quantization Scaling
+    const std::vector<size_t> seq_lens = {128, 512, 1024, 2048};
+    for (size_t seq_len : seq_lens) {
+        const size_t kv_heads = 16;
+        const size_t head_dim = 128;
+        const size_t total_elements = seq_len * kv_heads * head_dim;
+        const size_t group_size = 32;
+        
+        std::vector<__fp16> kv_src(total_elements);
+        std::vector<int8_t> kv_dst(total_elements);
+        std::vector<float> kv_scales(kv_scales_count(seq_len, kv_heads, head_dim, group_size));
+        setup_random_data<__fp16>(kv_src);
+
+        double ms = time_operation<__fp16>([&]() {
+            cactus_quantize_kv_fp16_to_int8(kv_src.data(), kv_dst.data(), kv_scales.data(), 
+                                            seq_len, kv_heads, head_dim, group_size);
+        }, config.iterations);
+
+        size_t num_groups = (head_dim + group_size - 1) / group_size;
+        size_t total_scale_bytes = seq_len * kv_heads * num_groups * sizeof(float);
+        double gbps = (total_elements * (sizeof(__fp16) + sizeof(int8_t)) + total_scale_bytes) / (ms * 1e6);
+
+        std::ostringstream details;
+        details << std::fixed << std::setprecision(3) << ms << "ms, "
+                << std::setprecision(2) << gbps << " GB/s";
+        runner.log_performance("KV Quant Scaling [L=" + std::to_string(seq_len) + "]",
+            details.str());
+    }
+}
+
+bool test_quantization_scaling_performance(TestUtils::TestRunner& runner) {
+    BenchmarkConfig config;
+    benchmark_quantization_scaling(runner, config);
+    return true;
+}
 
 int main() {
     TestUtils::TestRunner runner("Performance Benchmarks");
@@ -1036,6 +1092,7 @@ int main() {
     runner.run_test("Gather Operations", test_gather_operations_performance(runner));
     runner.run_test("Signals Operations", test_signals_performance(runner));
     runner.run_test("STFT Operations", test_stft_performance(runner));
+    runner.run_test("Quantization Scaling", test_quantization_scaling_performance(runner));
 
     runner.print_summary();
     return runner.all_passed() ? 0 : 1;
