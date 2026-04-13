@@ -616,7 +616,7 @@ void cactus_turboquant_encode_kv_fp16(
                 uint8_t* q_angles = dst_angles + idx * angles_bytes;
                 quantize_nbit(buf, q_angles, head_dim, angle_bits);
 
-                {
+                if (dst_error_norms) {
                     if (angle_bits == 2)
                         dequantize_2bit(q_angles, residual, head_dim);
                     else

@@ -116,16 +116,15 @@ static bool run_accuracy_config(size_t cache_len, size_t num_q_heads, size_t num
     std::vector<float> k_radii(num_vectors), v_radii(num_vectors);
     std::vector<uint8_t> k_angles(num_vectors * turboquant_angles_bytes_per_head(head_dim, key_angle_bits));
     std::vector<uint8_t> v_angles(num_vectors * turboquant_angles_bytes_per_head(head_dim, value_angle_bits));
-    std::vector<float> k_err_norms(num_vectors), v_err_norms(num_vectors);
+    std::vector<float> k_err_norms(num_vectors);
     std::vector<uint8_t> k_qjl(num_vectors * turboquant_qjl_bytes_per_head(projection_dim));
-    std::vector<uint8_t> v_qjl(num_vectors * turboquant_qjl_bytes_per_head(projection_dim));
 
     cactus_turboquant_encode_kv_fp16(k_cache.data(), k_radii.data(), k_angles.data(), k_err_norms.data(), k_qjl.data(), rot_signs.data(), proj_mat.data(), cache_len, num_kv_heads, head_dim, key_angle_bits, projection_dim);
-    cactus_turboquant_encode_kv_fp16(v_cache.data(), v_radii.data(), v_angles.data(), v_err_norms.data(), v_qjl.data(), rot_signs.data(), proj_mat.data(), cache_len, num_kv_heads, head_dim, value_angle_bits, projection_dim);
+    cactus_turboquant_encode_kv_fp16(v_cache.data(), v_radii.data(), v_angles.data(), nullptr, nullptr, rot_signs.data(), proj_mat.data(), cache_len, num_kv_heads, head_dim, value_angle_bits, projection_dim);
 
     std::vector<__fp16> out_tq(num_q_heads * head_dim);
     cactus_attention_hybrid_turboquant_fp16(queries.data(), k_radii.data(), k_angles.data(), k_err_norms.data(), k_qjl.data(),
-                                            v_radii.data(), v_angles.data(), v_err_norms.data(), v_qjl.data(),
+                                            v_radii.data(), v_angles.data(), nullptr, nullptr,
                                             rot_signs.data(), proj_mat.data(),
                                             nullptr, nullptr, out_tq.data(), batch_size, seq_len, cache_len, new_len,
                                             num_q_heads, num_kv_heads, head_dim, scale, key_angle_bits, value_angle_bits, projection_dim, 0, true, 0);
@@ -190,12 +189,11 @@ bool test_attention_performance() {
     std::vector<float> k_radii(num_vectors), v_radii(num_vectors);
     std::vector<uint8_t> k_angles(num_vectors * turboquant_angles_bytes_per_head(head_dim, key_angle_bits));
     std::vector<uint8_t> v_angles(num_vectors * turboquant_angles_bytes_per_head(head_dim, value_angle_bits));
-    std::vector<float> k_err_norms(num_vectors), v_err_norms(num_vectors);
+    std::vector<float> k_err_norms(num_vectors);
     std::vector<uint8_t> k_qjl(num_vectors * turboquant_qjl_bytes_per_head(projection_dim));
-    std::vector<uint8_t> v_qjl(num_vectors * turboquant_qjl_bytes_per_head(projection_dim));
 
     cactus_turboquant_encode_kv_fp16(k_cache.data(), k_radii.data(), k_angles.data(), k_err_norms.data(), k_qjl.data(), rot_signs.data(), proj_mat.data(), cache_len, num_kv_heads, head_dim, key_angle_bits, projection_dim);
-    cactus_turboquant_encode_kv_fp16(v_cache.data(), v_radii.data(), v_angles.data(), v_err_norms.data(), v_qjl.data(), rot_signs.data(), proj_mat.data(), cache_len, num_kv_heads, head_dim, value_angle_bits, projection_dim);
+    cactus_turboquant_encode_kv_fp16(v_cache.data(), v_radii.data(), v_angles.data(), nullptr, nullptr, rot_signs.data(), proj_mat.data(), cache_len, num_kv_heads, head_dim, value_angle_bits, projection_dim);
 
     int iterations = 10;
 
@@ -211,7 +209,7 @@ bool test_attention_performance() {
 
     double tq_time = TestUtils::time_function([&]() {
         cactus_attention_hybrid_turboquant_fp16(queries.data(), k_radii.data(), k_angles.data(), k_err_norms.data(), k_qjl.data(),
-                                                v_radii.data(), v_angles.data(), v_err_norms.data(), v_qjl.data(),
+                                                v_radii.data(), v_angles.data(), nullptr, nullptr,
                                                 rot_signs.data(), proj_mat.data(),
                                                 nullptr, nullptr, out_tq.data(), batch_size, seq_len, cache_len, new_len,
                                                 num_q_heads, num_kv_heads, head_dim, scale, key_angle_bits, value_angle_bits, projection_dim, 0, true, 0);
