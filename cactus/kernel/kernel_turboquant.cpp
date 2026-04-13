@@ -7,9 +7,20 @@
 #include <cstring>
 #include <vector>
 
+static constexpr float TQ_LLOYD_SLOPE    = 0.9966f;
+static constexpr float TQ_LLOYD_OFFSET   = -1.4949f;
+static constexpr float TQ_LLOYD_BOUNDARY = 0.9816f;
 
+static constexpr float TQ_4BIT_CENTROIDS[16] = {
+    -2.7326f, -2.0690f, -1.6180f, -1.2562f, -0.9424f, -0.6568f, -0.3882f, -0.1284f,
+     0.1284f,  0.3882f,  0.6568f,  0.9424f,  1.2562f,  1.6180f,  2.0690f,  2.7326f
+};
 
-static constexpr float PI_F = 3.14159265358979323846f;
+static constexpr float TQ_4BIT_BOUNDARIES[15] = {
+    -2.4008f, -1.8435f, -1.4371f, -1.0993f, -0.7996f, -0.5224f, -0.2582f,
+     0.0f,
+     0.2582f,  0.5224f,  0.7996f,  1.0993f,  1.4371f,  1.8435f,  2.4008f
+};
 
 struct Xoshiro256 {
     uint64_t s[4];
@@ -40,8 +51,7 @@ struct Xoshiro256 {
     }
 };
 
-
-static void hadamard_inplace(float* __restrict data, size_t dim) {
+void hadamard_inplace(float* __restrict data, size_t dim) {
     if (dim < 4 || (dim & (dim - 1)) != 0) return;
 
     size_t i = 0;
@@ -167,8 +177,7 @@ static void hadamard_inplace(float* __restrict data, size_t dim) {
     }
 }
 
-
-static inline void apply_signs(float* __restrict data, const uint8_t* __restrict signs_packed, size_t dim) {
+void apply_signs(float* __restrict data, const uint8_t* __restrict signs_packed, size_t dim) {
     const uint8x8_t kBitMasks = vcreate_u8(0x8040201008040201ULL);
     size_t i = 0;
     for (; i + 16 <= dim; i += 16) {
@@ -185,21 +194,16 @@ static inline void apply_signs(float* __restrict data, const uint8_t* __restrict
         vst1q_f32(data + i + 8,  vreinterpretq_f32_s32(veorq_s32(vreinterpretq_s32_f32(vld1q_f32(data + i + 8)),  f2)));
         vst1q_f32(data + i + 12, vreinterpretq_f32_s32(veorq_s32(vreinterpretq_s32_f32(vld1q_f32(data + i + 12)), f3)));
     }
-    for (; i < dim; i++) 
+    for (; i < dim; i++)
         if ((signs_packed[i / 8] >> (i % 8)) & 1) data[i] = -data[i];
 }
 
-// Compute 8 signed dot products simultaneously.
-// proj_group points to the interleaved group base for these 8 rows:
-//   projection_matrix + (p / 8) * rot_row_bytes * 8
-// Layout: proj_group[byte_idx * 8 + r] = byte for row r at bit-position byte_idx.
-// This allows a single vld1_u8 to load all 8 row-bytes per d-step instead of 8 scalar loads.
-static void signed_dot(
+void signed_dot(
     const uint8_t* __restrict proj_group,
     size_t rot_row_bytes,
     const float* __restrict vec,
     size_t dim,
-    float* __restrict out  // length 8
+    float* __restrict out
 ) {
     const uint8x8_t kBitMasks = vcreate_u8(0x8040201008040201ULL);
     float32x4_t acc0[8], acc1[8];
@@ -208,18 +212,13 @@ static void signed_dot(
         acc1[r] = vdupq_n_f32(0.0f);
     }
 
-    // dim is always a power-of-2 multiple of 8 (enforced by hadamard_inplace).
     for (size_t d = 0; d < dim; d += 8) {
         const size_t byte_idx = d / 8;
         float32x4_t v0 = vld1q_f32(vec + d);
         float32x4_t v1 = vld1q_f32(vec + d + 4);
-        // Hoist reinterpret outside r-loop: same value used by every row.
         int32x4_t iv0 = vreinterpretq_s32_f32(v0);
         int32x4_t iv1 = vreinterpretq_s32_f32(v1);
 
-        // One 8-byte load: all 8 row-bytes for this bit-position are contiguous.
-        // vget_lane requires a compile-time constant, so extract to a stack array;
-        // these 8 reads hit the store buffer / L1 immediately.
         uint8_t byte_arr[8];
         vst1_u8(byte_arr, vld1_u8(proj_group + byte_idx * 8));
 
@@ -237,17 +236,203 @@ static void signed_dot(
         out[r] = vaddvq_f32(vaddq_f32(acc0[r], acc1[r]));
 }
 
-static void rotate_forward(float* data, const uint8_t* signs_packed, size_t dim) {
+void rotate_forward(float* data, const uint8_t* signs_packed, size_t dim) {
     apply_signs(data, signs_packed, dim);
     hadamard_inplace(data, dim);
 }
 
-static void rotate_inverse(float* data, const uint8_t* signs_packed, size_t dim) {
+void rotate_inverse(float* data, const uint8_t* signs_packed, size_t dim) {
     hadamard_inplace(data, dim);
     apply_signs(data, signs_packed, dim);
+}
+
+float dot_2bit_f32(
+    const float* __restrict q,
+    float q_sum,
+    const uint8_t* __restrict packed,
+    size_t dim
+) {
+    const uint32x4_t mask2 = vdupq_n_u32(3);
+    const int32x4_t bit_shifts = {0, -2, -4, -6};
+
+    float32x4_t code_dot0 = vdupq_n_f32(0.0f);
+    float32x4_t code_dot1 = vdupq_n_f32(0.0f);
+    size_t p_idx = 0;
+    size_t i = 0;
+
+    for (; i + 16 <= dim; i += 16) {
+        uint32_t word;
+        memcpy(&word, packed + p_idx, 4); p_idx += 4;
+
+        uint32x4_t bv0 = vandq_u32(vshlq_u32(vdupq_n_u32( word        & 0xFF), bit_shifts), mask2);
+        uint32x4_t bv1 = vandq_u32(vshlq_u32(vdupq_n_u32((word >>  8) & 0xFF), bit_shifts), mask2);
+        uint32x4_t bv2 = vandq_u32(vshlq_u32(vdupq_n_u32((word >> 16) & 0xFF), bit_shifts), mask2);
+        uint32x4_t bv3 = vandq_u32(vshlq_u32(vdupq_n_u32( word >> 24),         bit_shifts), mask2);
+
+        code_dot0 = vfmaq_f32(code_dot0, vld1q_f32(q + i),      vcvtq_f32_u32(bv0));
+        code_dot1 = vfmaq_f32(code_dot1, vld1q_f32(q + i + 4),  vcvtq_f32_u32(bv1));
+        code_dot0 = vfmaq_f32(code_dot0, vld1q_f32(q + i + 8),  vcvtq_f32_u32(bv2));
+        code_dot1 = vfmaq_f32(code_dot1, vld1q_f32(q + i + 12), vcvtq_f32_u32(bv3));
+    }
+    for (; i + 4 <= dim; i += 4) {
+        uint32x4_t bv = vandq_u32(vshlq_u32(vdupq_n_u32(packed[p_idx++]), bit_shifts), mask2);
+        code_dot0 = vfmaq_f32(code_dot0, vld1q_f32(q + i), vcvtq_f32_u32(bv));
+    }
+
+    float code_dot = vaddvq_f32(vaddq_f32(code_dot0, code_dot1));
+    for (; i < dim; i++) {
+        uint8_t code = (packed[i / 4] >> ((i % 4) * 2)) & 0x3;
+        code_dot += q[i] * (float)code;
+    }
+
+    const float inv_sqrt_dim = 1.0f / sqrtf(static_cast<float>(dim));
+    return (TQ_LLOYD_SLOPE * code_dot + TQ_LLOYD_OFFSET * q_sum) * inv_sqrt_dim;
+}
+
+void accumulate_2bit_f32(
+    const uint8_t* __restrict packed,
+    float weight_radius,
+    float* __restrict accum,
+    size_t dim
+) {
+    const float inv_sqrt_dim = 1.0f / sqrtf(static_cast<float>(dim));
+    const uint32x4_t mask2 = vdupq_n_u32(3);
+    const int32x4_t bit_shifts = {0, -2, -4, -6};
+    const float32x4_t wr_half = vdupq_n_f32(TQ_LLOYD_SLOPE * inv_sqrt_dim * weight_radius);
+    const float32x4_t wr_off  = vdupq_n_f32(TQ_LLOYD_OFFSET * inv_sqrt_dim * weight_radius);
+
+    size_t p_idx = 0;
+    size_t i = 0;
+
+    for (; i + 16 <= dim; i += 16) {
+        uint32_t word;
+        memcpy(&word, packed + p_idx, 4); p_idx += 4;
+
+        float32x4_t c0 = vcvtq_f32_u32(vandq_u32(vshlq_u32(vdupq_n_u32( word        & 0xFF), bit_shifts), mask2));
+        float32x4_t c1 = vcvtq_f32_u32(vandq_u32(vshlq_u32(vdupq_n_u32((word >>  8) & 0xFF), bit_shifts), mask2));
+        float32x4_t c2 = vcvtq_f32_u32(vandq_u32(vshlq_u32(vdupq_n_u32((word >> 16) & 0xFF), bit_shifts), mask2));
+        float32x4_t c3 = vcvtq_f32_u32(vandq_u32(vshlq_u32(vdupq_n_u32( word >> 24),         bit_shifts), mask2));
+
+        vst1q_f32(accum + i,      vfmaq_f32(vaddq_f32(vld1q_f32(accum + i),      wr_off), c0, wr_half));
+        vst1q_f32(accum + i + 4,  vfmaq_f32(vaddq_f32(vld1q_f32(accum + i + 4),  wr_off), c1, wr_half));
+        vst1q_f32(accum + i + 8,  vfmaq_f32(vaddq_f32(vld1q_f32(accum + i + 8),  wr_off), c2, wr_half));
+        vst1q_f32(accum + i + 12, vfmaq_f32(vaddq_f32(vld1q_f32(accum + i + 12), wr_off), c3, wr_half));
+    }
+    for (; i + 4 <= dim; i += 4) {
+        float32x4_t c = vcvtq_f32_u32(vandq_u32(vshlq_u32(vdupq_n_u32(packed[p_idx++]), bit_shifts), mask2));
+        vst1q_f32(accum + i, vfmaq_f32(vaddq_f32(vld1q_f32(accum + i), wr_off), c, wr_half));
+    }
+    for (; i < dim; i++) {
+        uint8_t code = (packed[i / 4] >> ((i % 4) * 2)) & 0x3;
+        accum[i] += (TQ_LLOYD_SLOPE * (float)code + TQ_LLOYD_OFFSET) * inv_sqrt_dim * weight_radius;
+    }
+}
+
+static void quantize_4bit(const float* src, uint8_t* dst, size_t dim) {
+    const float sqrt_dim = sqrtf(static_cast<float>(dim));
+    const float32x4_t sd = vdupq_n_f32(sqrt_dim);
+
+    float32x4_t bv[15];
+    for (int b = 0; b < 15; b++)
+        bv[b] = vdupq_n_f32(TQ_4BIT_BOUNDARIES[b]);
+
+    size_t out = 0;
+    size_t i = 0;
+    for (; i + 4 <= dim; i += 4) {
+        float32x4_t vals = vmulq_f32(vld1q_f32(src + i), sd);
+
+        int32x4_t code = vdupq_n_s32(0);
+        for (int b = 0; b < 15; b++)
+            code = vsubq_s32(code, vreinterpretq_s32_u32(vcgtq_f32(vals, bv[b])));
+
+        code = vmaxq_s32(vminq_s32(code, vdupq_n_s32(15)), vdupq_n_s32(0));
+
+        int32_t c[4];
+        vst1q_s32(c, code);
+        dst[out++] = (uint8_t)((c[1] << 4) | c[0]);
+        dst[out++] = (uint8_t)((c[3] << 4) | c[2]);
+    }
+    for (; i + 2 <= dim; i += 2) {
+        float v0 = src[i] * sqrt_dim, v1 = src[i + 1] * sqrt_dim;
+        int c0 = 0, c1 = 0;
+        for (int b = 0; b < 15; b++) {
+            if (v0 > TQ_4BIT_BOUNDARIES[b]) c0 = b + 1;
+            if (v1 > TQ_4BIT_BOUNDARIES[b]) c1 = b + 1;
+        }
+        dst[out++] = (uint8_t)((c1 << 4) | c0);
+    }
+    if (i < dim) {
+        float v0 = src[i] * sqrt_dim;
+        int c0 = 0;
+        for (int b = 0; b < 15; b++)
+            if (v0 > TQ_4BIT_BOUNDARIES[b]) c0 = b + 1;
+        dst[out++] = (uint8_t)c0;
+    }
+}
+
+void dequantize_4bit(const uint8_t* src, float* dst, size_t dim) {
+    const float inv_sqrt_dim = 1.0f / sqrtf(static_cast<float>(dim));
+    float lut[16];
+    for (int i = 0; i < 16; i++)
+        lut[i] = TQ_4BIT_CENTROIDS[i] * inv_sqrt_dim;
+
+    size_t p = 0;
+    size_t i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        float tmp[8];
+        tmp[0] = lut[src[p]   & 0xF]; tmp[1] = lut[src[p]   >> 4];
+        tmp[2] = lut[src[p+1] & 0xF]; tmp[3] = lut[src[p+1] >> 4];
+        tmp[4] = lut[src[p+2] & 0xF]; tmp[5] = lut[src[p+2] >> 4];
+        tmp[6] = lut[src[p+3] & 0xF]; tmp[7] = lut[src[p+3] >> 4];
+        p += 4;
+        vst1q_f32(dst + i,     vld1q_f32(tmp));
+        vst1q_f32(dst + i + 4, vld1q_f32(tmp + 4));
+    }
+    for (; i + 2 <= dim; i += 2) {
+        dst[i]     = lut[src[p] & 0xF];
+        dst[i + 1] = lut[src[p] >> 4];
+        p++;
+    }
+    if (i < dim)
+        dst[i] = lut[src[p] & 0xF];
+}
+
+void accumulate_4bit_f32(
+    const uint8_t* __restrict packed,
+    float weight_radius,
+    float* __restrict accum,
+    size_t dim
+) {
+    const float inv_sqrt_dim = 1.0f / sqrtf(static_cast<float>(dim));
+    const float wr = inv_sqrt_dim * weight_radius;
+    float lut[16];
+    for (int i = 0; i < 16; i++)
+        lut[i] = TQ_4BIT_CENTROIDS[i] * wr;
+
+    size_t p = 0;
+    size_t i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        float tmp[8];
+        tmp[0] = lut[packed[p]   & 0xF]; tmp[1] = lut[packed[p]   >> 4];
+        tmp[2] = lut[packed[p+1] & 0xF]; tmp[3] = lut[packed[p+1] >> 4];
+        tmp[4] = lut[packed[p+2] & 0xF]; tmp[5] = lut[packed[p+2] >> 4];
+        tmp[6] = lut[packed[p+3] & 0xF]; tmp[7] = lut[packed[p+3] >> 4];
+        p += 4;
+        vst1q_f32(accum + i,     vaddq_f32(vld1q_f32(accum + i),     vld1q_f32(tmp)));
+        vst1q_f32(accum + i + 4, vaddq_f32(vld1q_f32(accum + i + 4), vld1q_f32(tmp + 4)));
+    }
+    for (; i + 2 <= dim; i += 2) {
+        accum[i]     += lut[packed[p] & 0xF];
+        accum[i + 1] += lut[packed[p] >> 4];
+        p++;
+    }
+    if (i < dim)
+        accum[i] += lut[packed[p] & 0xF];
 }
 
 static void quantize_2bit(const float* src, uint8_t* dst, size_t dim) {
+    const float quant_scale = sqrtf(static_cast<float>(dim)) / TQ_LLOYD_BOUNDARY;
+    const float32x4_t qs_vec = vdupq_n_f32(quant_scale);
     const float32x4_t two = vdupq_n_f32(2.0f);
     const int32x4_t zero_i = vdupq_n_s32(0);
     const int32x4_t three_i = vdupq_n_s32(3);
@@ -257,10 +442,10 @@ static void quantize_2bit(const float* src, uint8_t* dst, size_t dim) {
     size_t i = 0;
 
     for (; i + 16 <= dim; i += 16) {
-        int32x4_t c0 = vcvtmq_s32_f32(vfmaq_f32(two, vld1q_f32(&src[i]),      two));
-        int32x4_t c1 = vcvtmq_s32_f32(vfmaq_f32(two, vld1q_f32(&src[i + 4]),  two));
-        int32x4_t c2 = vcvtmq_s32_f32(vfmaq_f32(two, vld1q_f32(&src[i + 8]),  two));
-        int32x4_t c3 = vcvtmq_s32_f32(vfmaq_f32(two, vld1q_f32(&src[i + 12]), two));
+        int32x4_t c0 = vcvtmq_s32_f32(vfmaq_f32(two, vld1q_f32(&src[i]),      qs_vec));
+        int32x4_t c1 = vcvtmq_s32_f32(vfmaq_f32(two, vld1q_f32(&src[i + 4]),  qs_vec));
+        int32x4_t c2 = vcvtmq_s32_f32(vfmaq_f32(two, vld1q_f32(&src[i + 8]),  qs_vec));
+        int32x4_t c3 = vcvtmq_s32_f32(vfmaq_f32(two, vld1q_f32(&src[i + 12]), qs_vec));
         c0 = vmaxq_s32(vminq_s32(c0, three_i), zero_i);
         c1 = vmaxq_s32(vminq_s32(c1, three_i), zero_i);
         c2 = vmaxq_s32(vminq_s32(c2, three_i), zero_i);
@@ -275,14 +460,14 @@ static void quantize_2bit(const float* src, uint8_t* dst, size_t dim) {
         packed += 4;
     }
     for (; i + 4 <= dim; i += 4) {
-        int32x4_t c = vcvtmq_s32_f32(vfmaq_f32(two, vld1q_f32(&src[i]), two));
+        int32x4_t c = vcvtmq_s32_f32(vfmaq_f32(two, vld1q_f32(&src[i]), qs_vec));
         c = vmaxq_s32(vminq_s32(c, three_i), zero_i);
         dst[packed++] = (uint8_t)vaddvq_s32(vshlq_s32(c, shift4));
     }
     if (i < dim) {
         uint8_t byte = 0;
         for (size_t j = 0; j < dim - i; j++) {
-            int code = (int)floorf((src[i + j] + 1.0f) * 2.0f);
+            int code = (int)floorf(src[i + j] * quant_scale + 2.0f);
             code = std::max(0, std::min(3, code));
             byte |= (uint8_t)(code << (j * 2));
         }
@@ -290,10 +475,11 @@ static void quantize_2bit(const float* src, uint8_t* dst, size_t dim) {
     }
 }
 
-static void dequantize_2bit(const uint8_t* src, float* dst, size_t dim) {
+void dequantize_2bit(const uint8_t* src, float* dst, size_t dim) {
+    const float inv_sqrt_dim = 1.0f / sqrtf(static_cast<float>(dim));
     const uint32x4_t mask = vdupq_n_u32(3);
-    const float32x4_t half = vdupq_n_f32(0.5f);
-    const float32x4_t offset = vdupq_n_f32(-0.75f);
+    const float32x4_t slope_v  = vdupq_n_f32(TQ_LLOYD_SLOPE * inv_sqrt_dim);
+    const float32x4_t offset_v = vdupq_n_f32(TQ_LLOYD_OFFSET * inv_sqrt_dim);
     static const int32_t shift_arr[4] = {0, -2, -4, -6};
     const int32x4_t bit_shifts = vld1q_s32(shift_arr);
     size_t packed = 0;
@@ -306,22 +492,27 @@ static void dequantize_2bit(const uint8_t* src, float* dst, size_t dim) {
         uint32x4_t bv1 = vdupq_n_u32((word >>  8) & 0xFF);
         uint32x4_t bv2 = vdupq_n_u32((word >> 16) & 0xFF);
         uint32x4_t bv3 = vdupq_n_u32( word >> 24);
-        vst1q_f32(&dst[i],      vfmaq_f32(offset, vcvtq_f32_u32(vandq_u32(vshlq_u32(bv0, bit_shifts), mask)), half));
-        vst1q_f32(&dst[i + 4],  vfmaq_f32(offset, vcvtq_f32_u32(vandq_u32(vshlq_u32(bv1, bit_shifts), mask)), half));
-        vst1q_f32(&dst[i + 8],  vfmaq_f32(offset, vcvtq_f32_u32(vandq_u32(vshlq_u32(bv2, bit_shifts), mask)), half));
-        vst1q_f32(&dst[i + 12], vfmaq_f32(offset, vcvtq_f32_u32(vandq_u32(vshlq_u32(bv3, bit_shifts), mask)), half));
+        vst1q_f32(&dst[i],      vfmaq_f32(offset_v, vcvtq_f32_u32(vandq_u32(vshlq_u32(bv0, bit_shifts), mask)), slope_v));
+        vst1q_f32(&dst[i + 4],  vfmaq_f32(offset_v, vcvtq_f32_u32(vandq_u32(vshlq_u32(bv1, bit_shifts), mask)), slope_v));
+        vst1q_f32(&dst[i + 8],  vfmaq_f32(offset_v, vcvtq_f32_u32(vandq_u32(vshlq_u32(bv2, bit_shifts), mask)), slope_v));
+        vst1q_f32(&dst[i + 12], vfmaq_f32(offset_v, vcvtq_f32_u32(vandq_u32(vshlq_u32(bv3, bit_shifts), mask)), slope_v));
     }
     for (; i + 4 <= dim; i += 4) {
         uint32x4_t bv = vdupq_n_u32(src[packed++]);
-        vst1q_f32(&dst[i], vfmaq_f32(offset, vcvtq_f32_u32(vandq_u32(vshlq_u32(bv, bit_shifts), mask)), half));
+        vst1q_f32(&dst[i], vfmaq_f32(offset_v, vcvtq_f32_u32(vandq_u32(vshlq_u32(bv, bit_shifts), mask)), slope_v));
     }
     if (i < dim) {
         uint8_t byte = src[packed];
         for (size_t j = 0; j < dim - i; j++) {
             uint8_t code = (byte >> (j * 2)) & 0x03;
-            dst[i + j] = (float)(2 * (int)code - 3) * 0.25f;
+            dst[i + j] = (TQ_LLOYD_SLOPE * (float)code + TQ_LLOYD_OFFSET) * inv_sqrt_dim;
         }
     }
+}
+
+static void quantize_nbit(const float* src, uint8_t* dst, size_t dim, size_t angle_bits) {
+    if (angle_bits == 2) quantize_2bit(src, dst, dim);
+    else                 quantize_4bit(src, dst, dim);
 }
 
 void cactus_turboquant_init(
@@ -331,8 +522,6 @@ void cactus_turboquant_init(
     assert((head_dim & (head_dim - 1)) == 0 && head_dim >= 8);
     Xoshiro256 rng(seed);
 
-    // Pack rotation_signs: head_dim bits = head_dim/8 bytes.
-    // Use all 8 bytes of each next() call to avoid wasting entropy.
     const size_t rot_bytes = head_dim / 8;
     for (size_t i = 0; i < rot_bytes; ) {
         uint64_t w = rng.next();
@@ -341,10 +530,6 @@ void cactus_turboquant_init(
         i += n;
     }
 
-    // Pack projection_matrix in interleaved groups of 8 rows:
-    // layout[group * rot_row_bytes * 8 + byte_idx * 8 + row_in_group]
-    // All 8 row-bytes for a given byte_idx are contiguous, so signed_dot
-    // can replace 8 scalar loads with one vld1_u8 per outer loop iteration.
     const size_t num_groups = (projection_dim + 7) / 8;
     for (size_t g = 0; g < num_groups; g++) {
         for (size_t byte_idx = 0; byte_idx < rot_bytes; byte_idx++) {
@@ -361,7 +546,6 @@ void cactus_turboquant_encode_kv_fp16(
     size_t seq_len, size_t kv_heads, size_t head_dim,
     size_t angle_bits, size_t projection_dim
 ) {
-    assert(angle_bits == TURBOQUANT_ANGLE_BITS);
     assert((head_dim & (head_dim - 1)) == 0);
     assert(head_dim <= 512);
 
@@ -372,8 +556,10 @@ void cactus_turboquant_encode_kv_fp16(
     CactusThreading::parallel_for(
         seq_len * kv_heads, CactusThreading::Thresholds::ELEMENT_WISE,
         [=](size_t start, size_t end) {
-            alignas(16) float buf[512]; // Static stack arrays used over std::vector for lock-free parallel performance
-            alignas(16) float residual[512];
+            std::vector<float> _buf(head_dim);
+            std::vector<float> _residual(head_dim);
+            float* buf = _buf.data();
+            float* residual = _residual.data();
 
             for (size_t idx = start; idx < end; idx++) {
                 const __fp16* in = src + idx * head_dim;
@@ -428,37 +614,26 @@ void cactus_turboquant_encode_kv_fp16(
 
                 rotate_forward(buf, rotation_signs, head_dim);
                 uint8_t* q_angles = dst_angles + idx * angles_bytes;
-                quantize_2bit(buf, q_angles, head_dim);
+                quantize_nbit(buf, q_angles, head_dim, angle_bits);
 
                 {
-                    const uint32x4_t mask2   = vdupq_n_u32(3);
-                    const float32x4_t half   = vdupq_n_f32(0.5f);
-                    const float32x4_t offset = vdupq_n_f32(-0.75f);
-                    static const int32_t shift_arr[4] = {0, -2, -4, -6};
-                    const int32x4_t bit_shifts = vld1q_s32(shift_arr);
+                    if (angle_bits == 2)
+                        dequantize_2bit(q_angles, residual, head_dim);
+                    else
+                        dequantize_4bit(q_angles, residual, head_dim);
+
                     float32x4_t r_vec    = vdupq_n_f32(radius);
                     float32x4_t err_acc0 = vdupq_n_f32(0.0f);
                     float32x4_t err_acc1 = vdupq_n_f32(0.0f);
                     float32x4_t abs_acc0 = vdupq_n_f32(0.0f);
                     float32x4_t abs_acc1 = vdupq_n_f32(0.0f);
-                    size_t packed = 0;
                     d = 0;
 
                     for (; d + 16 <= head_dim; d += 16) {
-                        uint32_t word;
-                        memcpy(&word, q_angles + packed, 4); packed += 4;
-                        uint32x4_t bv0 = vdupq_n_u32( word        & 0xFF);
-                        uint32x4_t bv1 = vdupq_n_u32((word >>  8) & 0xFF);
-                        uint32x4_t bv2 = vdupq_n_u32((word >> 16) & 0xFF);
-                        uint32x4_t bv3 = vdupq_n_u32( word >> 24);
-                        float32x4_t dq0 = vfmaq_f32(offset, vcvtq_f32_u32(vandq_u32(vshlq_u32(bv0, bit_shifts), mask2)), half);
-                        float32x4_t dq1 = vfmaq_f32(offset, vcvtq_f32_u32(vandq_u32(vshlq_u32(bv1, bit_shifts), mask2)), half);
-                        float32x4_t dq2 = vfmaq_f32(offset, vcvtq_f32_u32(vandq_u32(vshlq_u32(bv2, bit_shifts), mask2)), half);
-                        float32x4_t dq3 = vfmaq_f32(offset, vcvtq_f32_u32(vandq_u32(vshlq_u32(bv3, bit_shifts), mask2)), half);
-                        float32x4_t e0 = vmulq_f32(vsubq_f32(vld1q_f32(buf + d),      dq0), r_vec);
-                        float32x4_t e1 = vmulq_f32(vsubq_f32(vld1q_f32(buf + d + 4),  dq1), r_vec);
-                        float32x4_t e2 = vmulq_f32(vsubq_f32(vld1q_f32(buf + d + 8),  dq2), r_vec);
-                        float32x4_t e3 = vmulq_f32(vsubq_f32(vld1q_f32(buf + d + 12), dq3), r_vec);
+                        float32x4_t e0 = vmulq_f32(vsubq_f32(vld1q_f32(buf + d),      vld1q_f32(residual + d)),      r_vec);
+                        float32x4_t e1 = vmulq_f32(vsubq_f32(vld1q_f32(buf + d + 4),  vld1q_f32(residual + d + 4)),  r_vec);
+                        float32x4_t e2 = vmulq_f32(vsubq_f32(vld1q_f32(buf + d + 8),  vld1q_f32(residual + d + 8)),  r_vec);
+                        float32x4_t e3 = vmulq_f32(vsubq_f32(vld1q_f32(buf + d + 12), vld1q_f32(residual + d + 12)), r_vec);
                         vst1q_f32(residual + d,      e0);
                         vst1q_f32(residual + d + 4,  e1);
                         vst1q_f32(residual + d + 8,  e2);
@@ -471,9 +646,7 @@ void cactus_turboquant_encode_kv_fp16(
                         abs_acc1 = vaddq_f32(abs_acc1, vabsq_f32(e3));
                     }
                     for (; d + 4 <= head_dim; d += 4) {
-                        uint32x4_t bv = vdupq_n_u32(q_angles[packed++]);
-                        float32x4_t dq0 = vfmaq_f32(offset, vcvtq_f32_u32(vandq_u32(vshlq_u32(bv, bit_shifts), mask2)), half);
-                        float32x4_t e = vmulq_f32(vsubq_f32(vld1q_f32(buf + d), dq0), r_vec);
+                        float32x4_t e = vmulq_f32(vsubq_f32(vld1q_f32(buf + d), vld1q_f32(residual + d)), r_vec);
                         vst1q_f32(residual + d, e);
                         err_acc0 = vfmaq_f32(err_acc0, e, e);
                         abs_acc0 = vaddq_f32(abs_acc0, vabsq_f32(e));
@@ -481,16 +654,6 @@ void cactus_turboquant_encode_kv_fp16(
 
                     float err_sq = vaddvq_f32(vaddq_f32(err_acc0, err_acc1));
                     float sum_abs_res = vaddvq_f32(vaddq_f32(abs_acc0, abs_acc1)) + 1e-10f;
-
-                    // Can delete (for cases where head_dim is not a multiple of 4 (not possible for hadamard))
-                    for (; d < head_dim; d++) {
-                        uint8_t code = (q_angles[d / 4] >> ((d % 4) * 2)) & 0x3;
-                        float dq_v = (float)(2 * (int)code - 3) * 0.25f;
-                        float e = (buf[d] - dq_v) * radius;
-                        residual[d] = e;
-                        err_sq      += e * e;
-                        sum_abs_res += std::abs(e);
-                    }
 
                     dst_error_norms[idx] = sqrtf(err_sq);
 
@@ -518,7 +681,6 @@ void cactus_turboquant_encode_kv_fp16(
                         }
                     }
                     for (; p < projection_dim; p++) {
-                        // Interleaved layout: proj[group * rot_row_bytes * 8 + byte_idx * 8 + row_in_group]
                         const size_t group        = p / 8;
                         const size_t row_in_group = p % 8;
                         const uint8_t* grp        = projection_matrix + group * rot_row_bytes * 8;
@@ -546,10 +708,14 @@ void cactus_turboquant_decode_kv_fp16(
     CactusThreading::parallel_for(
         seq_len * kv_heads, CactusThreading::Thresholds::ELEMENT_WISE,
         [=](size_t start, size_t end) {
-            alignas(16) float buf[512];
+            std::vector<float> _buf(head_dim);
+            float* buf = _buf.data();
             for (size_t idx = start; idx < end; idx++) {
                 float radius = radii[idx];
-                dequantize_2bit(angles + idx * angles_bytes, buf, head_dim);
+                if (angle_bits == 2)
+                    dequantize_2bit(angles + idx * angles_bytes, buf, head_dim);
+                else
+                    dequantize_4bit(angles + idx * angles_bytes, buf, head_dim);
                 float32x4_t r_vec = vdupq_n_f32(radius);
                 size_t d = 0;
                 for (; d + 16 <= head_dim; d += 16) {
@@ -578,12 +744,7 @@ void cactus_turboquant_decode_kv_fp16(
         });
 }
 
-static inline float fast_sin_half_pi(float x) {
-    float x2 = x * x;
-    return x * (1.0f - x2 * (1.0f/6.0f - x2 * (1.0f/120.0f)));
-}
-
-static inline size_t xnor_popcount(const uint8_t* a, const uint8_t* b, size_t nbytes) {
+size_t xnor_popcount(const uint8_t* a, const uint8_t* b, size_t nbytes) {
     uint32x4_t acc = vdupq_n_u32(0);
     size_t i = 0;
     for (; i + 16 <= nbytes; i += 16) {
@@ -595,94 +756,3 @@ static inline size_t xnor_popcount(const uint8_t* a, const uint8_t* b, size_t nb
         result += __builtin_popcount(~(a[i] ^ b[i]) & 0xFF);
     return result;
 }
-
-static inline float turboquant_score(
-    const __fp16* q_rot, float q_norm,
-    const uint8_t* q_qjl, float radius,
-    const uint8_t* angs, float err_norm,
-    const uint8_t* k_qjl,
-    float* dq, size_t head_dim, size_t qjl_bytes, size_t projection_dim
-) {
-    dequantize_2bit(angs, dq, head_dim);
-
-    float32x4_t acc0 = vdupq_n_f32(0.0f);
-    float32x4_t acc1 = vdupq_n_f32(0.0f);
-    size_t d = 0;
-    for (; d + 16 <= head_dim; d += 16) {
-        float16x8_t q0 = vld1q_f16(q_rot + d);
-        float16x8_t q1 = vld1q_f16(q_rot + d + 8);
-        acc0 = vfmaq_f32(vfmaq_f32(acc0,
-            vcvt_f32_f16(vget_low_f16(q0)),  vld1q_f32(dq + d)),
-            vcvt_f32_f16(vget_high_f16(q0)), vld1q_f32(dq + d + 4));
-        acc1 = vfmaq_f32(vfmaq_f32(acc1,
-            vcvt_f32_f16(vget_low_f16(q1)),  vld1q_f32(dq + d + 8)),
-            vcvt_f32_f16(vget_high_f16(q1)), vld1q_f32(dq + d + 12));
-    }
-    for (; d + 8 <= head_dim; d += 8) {
-        float16x8_t q = vld1q_f16(q_rot + d);
-        acc0 = vfmaq_f32(vfmaq_f32(acc0,
-            vcvt_f32_f16(vget_low_f16(q)),  vld1q_f32(dq + d)),
-            vcvt_f32_f16(vget_high_f16(q)), vld1q_f32(dq + d + 4));
-    }
-    float polar_dot = vaddvq_f32(vaddq_f32(acc0, acc1));
-    for (; d < head_dim; d++) polar_dot += static_cast<float>(q_rot[d]) * dq[d];
-    polar_dot *= radius;
-
-    size_t matches  = xnor_popcount(k_qjl, q_qjl, qjl_bytes);
-    float avg_sign  = (2.0f * static_cast<float>(matches) - static_cast<float>(projection_dim))
-                      / static_cast<float>(projection_dim);
-    float correction = q_norm * err_norm * fast_sin_half_pi(PI_F * 0.5f * avg_sign);
-    return polar_dot + correction;
-}
-
-void cactus_turboquant_decode_dot_fp16(
-    const __fp16* query_rotated, const float* query_norms, const uint8_t* query_qjl_bits,
-    const float* cached_radii, const uint8_t* cached_angles,
-    const float* cached_error_norms, const uint8_t* cached_qjl_bits,
-    float* output, size_t kv_seq_len, size_t num_q_heads, size_t num_kv_heads,
-    size_t head_dim, size_t angle_bits, size_t projection_dim, float scale
-) {
-    const size_t angles_bytes = turboquant_angles_bytes_per_head(head_dim, angle_bits);
-    const size_t qjl_bytes    = turboquant_qjl_bytes_per_head(projection_dim);
-    const size_t group_size   = num_q_heads / num_kv_heads;
-
-    CactusThreading::parallel_for(
-        num_q_heads, CactusThreading::Thresholds::ELEMENT_WISE,
-        [=](size_t start, size_t end) {
-            alignas(16) float dq[512];
-
-            for (size_t q_head = start; q_head < end; q_head++) {
-                const size_t   kv_head = q_head / group_size;
-                const __fp16*  q_rot   = query_rotated  + q_head * head_dim;
-                const float    q_norm  = query_norms[q_head];
-                const uint8_t* q_qjl  = query_qjl_bits + q_head * qjl_bytes;
-                float*         out_row = output          + q_head * kv_seq_len;
-
-                for (size_t kv_pos = 0; kv_pos < kv_seq_len; kv_pos++) {
-                    const size_t idx = kv_pos * num_kv_heads + kv_head;
-                    out_row[kv_pos] = turboquant_score(
-                        q_rot, q_norm, q_qjl,
-                        cached_radii[idx],
-                        cached_angles      + idx * angles_bytes,
-                        cached_error_norms[idx],
-                        cached_qjl_bits    + idx * qjl_bytes,
-                        dq, head_dim, qjl_bytes, projection_dim
-                    ) * scale;
-                }
-            }
-        });
-}
-
-float cactus_turboquant_dot(
-    const __fp16* q_rot, float q_norm, float radius, const uint8_t* angles, float error_norm,
-    const uint8_t* qjl_bits, const uint8_t* query_qjl_bits, size_t head_dim, size_t projection_dim
-) {
-    alignas(16) float dq[512];
-    const size_t qjl_bytes = turboquant_qjl_bytes_per_head(projection_dim);
-    return turboquant_score(
-        q_rot, q_norm, query_qjl_bits,
-        radius, angles, error_norm, qjl_bits,
-        dq, head_dim, qjl_bytes, projection_dim
-    );
-}
-
