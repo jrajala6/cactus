@@ -200,7 +200,6 @@ void apply_signs(float* __restrict data, const uint8_t* __restrict signs_packed,
 
 void signed_dot(
     const uint8_t* __restrict proj_group,
-    size_t rot_row_bytes,
     const float* __restrict vec,
     size_t dim,
     float* __restrict out
@@ -666,7 +665,7 @@ void cactus_turboquant_encode_kv_fp16(
                     size_t p = 0;
                     for (; p + 8 <= projection_dim; p += 8) {
                         float dots[8];
-                        signed_dot(projection_matrix + (p / 8) * rot_row_bytes * 8, rot_row_bytes, residual, head_dim, dots);
+                        signed_dot(projection_matrix + (p / 8) * rot_row_bytes * 8, residual, head_dim, dots);
 
                         uint64_t rand_word = rng.next();
                         for (int r = 0; r < 8; r++) {

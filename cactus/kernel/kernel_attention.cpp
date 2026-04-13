@@ -890,7 +890,6 @@ void cactus_attention_hybrid_turboquant_fp16(
     const float *cached_key_radii,      const uint8_t *cached_key_angles,
     const float *cached_key_error_norms, const uint8_t *cached_key_qjl_bits,
     const float *cached_value_radii,    const uint8_t *cached_value_angles,
-    const float *cached_value_error_norms, const uint8_t *cached_value_qjl_bits,
     const uint8_t *rotation_signs, const uint8_t *projection_matrix,
     const __fp16 *keys_new, const __fp16 *values_new, __fp16 *output,
     size_t batch_size, size_t seq_len, size_t cache_len, size_t new_len,
@@ -1020,7 +1019,7 @@ void cactus_attention_hybrid_turboquant_fp16(
                     size_t p = 0;
                     for (; p + 8 <= projection_dim; p += 8) {
                         signed_dot(projection_matrix + (p >> 3) * rot_row_bytes * 8,
-                                   rot_row_bytes, q_rot_f32, head_dim, jl_dots);
+                                   q_rot_f32, head_dim, jl_dots);
                         for (int r = 0; r < 8; r++) {
                             if (jl_dots[r] > 0.f) {
                                 const size_t slot = p + r;

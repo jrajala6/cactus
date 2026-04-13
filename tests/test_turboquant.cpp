@@ -124,7 +124,7 @@ static bool run_accuracy_config(size_t cache_len, size_t num_q_heads, size_t num
 
     std::vector<__fp16> out_tq(num_q_heads * head_dim);
     cactus_attention_hybrid_turboquant_fp16(queries.data(), k_radii.data(), k_angles.data(), k_err_norms.data(), k_qjl.data(),
-                                            v_radii.data(), v_angles.data(), nullptr, nullptr,
+                                            v_radii.data(), v_angles.data(),
                                             rot_signs.data(), proj_mat.data(),
                                             nullptr, nullptr, out_tq.data(), batch_size, seq_len, cache_len, new_len,
                                             num_q_heads, num_kv_heads, head_dim, scale, key_angle_bits, value_angle_bits, projection_dim, 0, true, 0);
@@ -209,7 +209,7 @@ bool test_attention_performance() {
 
     double tq_time = TestUtils::time_function([&]() {
         cactus_attention_hybrid_turboquant_fp16(queries.data(), k_radii.data(), k_angles.data(), k_err_norms.data(), k_qjl.data(),
-                                                v_radii.data(), v_angles.data(), nullptr, nullptr,
+                                                v_radii.data(), v_angles.data(),
                                                 rot_signs.data(), proj_mat.data(),
                                                 nullptr, nullptr, out_tq.data(), batch_size, seq_len, cache_len, new_len,
                                                 num_q_heads, num_kv_heads, head_dim, scale, key_angle_bits, value_angle_bits, projection_dim, 0, true, 0);
